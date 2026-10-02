@@ -28,6 +28,10 @@ ticker_input = st.sidebar.text_area(
     "Tickers (gescheiden door komma)", default_tickers, height=140
 )
 
+# Benchmark Ticker en instellingen voor RS Score
+SPY_TICKER = "SPY"
+ATR_MAX_PCT = 3.0
+
 
 # ─────────────────────────────────────────────────────────────
 # TRADING SCORE BEREKENING (EXACT TRADINGVIEW MATCH)
@@ -73,12 +77,93 @@ def calculate_trading_score(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def calculate_stable_rs_score(df_stock: pd.DataFrame, df_spy: pd.DataFrame, atr_max_pct: float = 3.0) -> int:
+    """Berekent de Stable Relative Strength Score (0 - 100) exact volgens het tweede Pine Script."""
+    try:
+        # Synchroniseer datums van aandeel en SPY
+        combined = pd.DataFrame({
+            "stock_close": df_stock["Close"],
+            "stock_high": df_stock["High"],
+            "stock_low": df_stock["Low"],
+            "stock_volume": df_stock["Volume"],
+            "spy_close": df_spy["Close"]
+        }).dropna()
+
+        if len(combined) < 22:
+            return 0
+
+        # --- 1. RELATIEVE STERKTE VS SPY ---
+        stock_ret = combined["stock_close"] / combined["stock_close"].shift(1)
+        spy_ret = combined["spy_close"] / combined["spy_close"].shift(1)
+        rs_ratio = stock_ret / spy_ret
+
+        latest_rs = rs_ratio.iloc[-1]
+        if latest_rs >= 1.0:
+            rs_score = 35
+        elif latest_rs >= 0.99:
+            rs_score = 20
+        else:
+            rs_score = 0
+
+        # --- 2. TREND & INTRADAY STABILITEIT ---
+        ema9 = combined["stock_close"].ewm(span=9, adjust=False).mean()
+        ema21 = combined["stock_close"].ewm(span=21, adjust=False).mean()
+
+        close_last = combined["stock_close"].iloc[-1]
+        ema9_last = ema9.iloc[-1]
+        ema21_last = ema21.iloc[-1]
+
+        if close_last > ema9_last and ema9_last > ema21_last:
+            trend_score = 25
+        elif close_last > ema21_last:
+            trend_score = 15
+        else:
+            trend_score = 0
+
+        # --- 3. VOLATILITEIT / DOWNSIDE PROTECTION (ATR 14) ---
+        prev_close = combined["stock_close"].shift(1)
+        tr1 = combined["stock_high"] - combined["stock_low"]
+        tr2 = (combined["stock_high"] - prev_close).abs()
+        tr3 = (combined["stock_low"] - prev_close).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        # Pine Script ta.atr(14) gebruikt RMA (Wilder Smoothing)
+        atr14 = tr.ewm(alpha=1/14, adjust=False).mean()
+        atr_val = atr14.iloc[-1]
+        atr_pct = (atr_val / close_last) * 100
+
+        if atr_pct <= atr_max_pct:
+            vol_score = 25
+        elif atr_pct <= (atr_max_pct + 1.5):
+            vol_score = 15
+        else:
+            vol_score = 0
+
+        # --- 4. RELATIEF VOLUME (RVOL) ---
+        sma_vol20 = combined["stock_volume"].rolling(window=20).mean()
+        rvol = (combined["stock_volume"] / sma_vol20).iloc[-1]
+
+        if rvol >= 1.2:
+            rvol_score = 15
+        elif rvol >= 1.0:
+            rvol_score = 10
+        else:
+            rvol_score = 0
+
+        # TOTAALSCORE (0 - 100)
+        total_score = rs_score + trend_score + vol_score + rvol_score
+        return int(total_score)
+
+    except Exception:
+        return 0
+
+
 def get_signal_badge(score: int) -> str:
     """Vertaalt de score naar een compact signaal met emoji."""
     mapping = {
         5: "🚀 Strong Buy (5)",
         4: "📈 Buy (4)",
-        3: "⚖️ Hold (3)",
+        3: "⚖️️ Hold (3)",
         2: "📉 Sell (2)",
         1: "🔴 Strong Sell (1)",
         0: "🔴 Strong Sell (0)",
@@ -101,6 +186,14 @@ if (
     progress_bar = st.progress(0)
     status_text = st.empty()
 
+    # Haal SPY dagkoersen op voor de Stable RS Score berekening
+    try:
+        spy_df_daily = yf.download(SPY_TICKER, period="60d", interval="1d", progress=False)
+        if isinstance(spy_df_daily.columns, pd.MultiIndex):
+            spy_df_daily.columns = spy_df_daily.columns.get_level_values(0)
+    except Exception:
+        spy_df_daily = pd.DataFrame()
+
     timeframes = [
         ("1d", "60d", "1D"),
         ("1h", "60d", "1H"),
@@ -109,10 +202,11 @@ if (
 
     for i, ticker in enumerate(tickers):
         status_text.text(
-            f"Bezig met analyseren van {ticker} (1D, 1H en 15M)..."
+            f"Bezig met analyseren van {ticker} (1D, 1H, 15M & RS Score)..."
         )
         ticker_data = {"Ticker": ticker, "Prijs ($)": "N/A"}
         total_score_sum = 0
+        stock_daily_df = pd.DataFrame()
 
         for interval, period, label in timeframes:
             try:
@@ -123,6 +217,9 @@ if (
                 if not data.empty and len(data) >= 20:
                     if isinstance(data.columns, pd.MultiIndex):
                         data.columns = data.columns.get_level_values(0)
+
+                    if interval == "1d":
+                        stock_daily_df = data.copy()
 
                     df = calculate_trading_score(data)
                     latest = df.iloc[-1]
@@ -144,6 +241,13 @@ if (
             except Exception as e:
                 ticker_data[f"Score {label}"] = 0
                 ticker_data[f"Signaal {label}"] = "Fout"
+
+        # Bereken de Stable RS Score als laatste vakje/kolom
+        if not stock_daily_df.empty and not spy_df_daily.empty:
+            rs_score_val = calculate_stable_rs_score(stock_daily_df, spy_df_daily, ATR_MAX_PCT)
+            ticker_data["RS Score (0-100)"] = rs_score_val
+        else:
+            ticker_data["RS Score (0-100)"] = 0
 
         # Gemiddelde score voor sortering op totaalbeeld
         ticker_data["Totale Matrix Score"] = total_score_sum
@@ -173,12 +277,21 @@ if (
                     return "background-color: #dc3545; color: white; font-weight: bold;"
             return ""
 
+        def highlight_rs_score(val):
+            if isinstance(val, int):
+                if val >= 70:
+                    return "background-color: #28a745; color: white; font-weight: bold;"
+                elif val >= 50:
+                    return "background-color: #fd7e14; color: white; font-weight: bold;"
+                else:
+                    return "background-color: #dc3545; color: white; font-weight: bold;"
+            return ""
+
         st.subheader("📋 Multi-Timeframe Score Overzicht")
         st.dataframe(
-            display_df.style.map(
-                highlight_scores,
-                subset=["Score 1D", "Score 1H", "Score 15M"],
-            ),
+            display_df.style
+            .map(highlight_scores, subset=["Score 1D", "Score 1H", "Score 15M"])
+            .map(highlight_rs_score, subset=["RS Score (0-100)"]),
             use_container_width=True,
             hide_index=True,
         )
