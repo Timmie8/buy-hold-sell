@@ -7,12 +7,14 @@ import yfinance as yf
 # STREAMLIT PAGE CONFIG
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Auto Trading Score Scanner", page_icon="📊", layout="wide"
+    page_title="Multi-Timeframe Trading Score Scanner",
+    page_icon="📊",
+    layout="wide",
 )
 
-st.title("📊 Auto Trading Score Scanner")
+st.title("📊 Multi-Timeframe Auto Trading Score Scanner")
 st.caption(
-    "Exacte Python/Streamlit vertaling van de Pine Script MA5/MA15 + VWAP + Volume indicator."
+    "Scant elk aandeel direct op 1 Dag (1D), 1 Uur (1H) en 15 Minuten (15M) volgens de exacte Pine Script logica."
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -23,19 +25,8 @@ st.sidebar.header("⚙️ Instellingen")
 # Standaard tickerlijst
 default_tickers = "AAPL, MSFT, NVDA, TSLA, AMZN, GOOGL, META, AMD, INTC, PLTR"
 ticker_input = st.sidebar.text_area(
-    "Tickers (gescheiden door komma)", default_tickers, height=120
+    "Tickers (gescheiden door komma)", default_tickers, height=140
 )
-
-# Timeframe / Interval keuzes
-interval_choice = st.sidebar.selectbox(
-    "Interval",
-    options=["1d", "1h", "15m", "5m"],
-    index=0,
-    help="Kies het tijdsframe voor de indicatoren.",
-)
-
-# Period dynamisch bepalen afhankelijk van interval
-period_choice = "60d" if interval_choice in ["1d", "1h"] else "7d"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -43,6 +34,7 @@ period_choice = "60d" if interval_choice in ["1d", "1h"] else "7d"
 # ─────────────────────────────────────────────────────────────
 def calculate_trading_score(df: pd.DataFrame) -> pd.DataFrame:
     """Berekent de indicatoren en 5 regels exact zoals in Pine Script v5."""
+    df = df.copy()
     df.index = pd.to_datetime(df.index)
 
     # 1. Moving Averages (EMA 5 & EMA 15)
@@ -67,20 +59,10 @@ def calculate_trading_score(df: pd.DataFrame) -> pd.DataFrame:
     # ─────────────────────────────────────────────────────────
     # REGELS (0 of 1)
     # ─────────────────────────────────────────────────────────
-
-    # Rule 1: Trend (MA5 > MA15)
     df["Rule1"] = (df["EMA5"] > df["EMA15"]).astype(int)
-
-    # Rule 2: VWAP position (Close > VWAP)
     df["Rule2"] = (df["Close"] > df["VWAP"]).astype(int)
-
-    # Rule 3: Volume spike (Volume > VolSMA20)
     df["Rule3"] = (df["Volume"] > df["VolSMA20"]).astype(int)
-
-    # Rule 4: Momentum continuation (Close > MA5)
     df["Rule4"] = (df["Close"] > df["EMA5"]).astype(int)
-
-    # Rule 5: Structure (MA15 slope > 0 op vorige bar)
     df["Rule5"] = (df["EMA15"] > df["EMA15"].shift(1)).astype(int)
 
     # Totale Score (0 t/m 5)
@@ -91,15 +73,15 @@ def calculate_trading_score(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def get_signal_text(score: int) -> str:
-    """Vertaalt de score naar de exacte tekst van de Pine Script switch statement."""
+def get_signal_badge(score: int) -> str:
+    """Vertaalt de score naar een compact signaal met emoji."""
     mapping = {
-        5: "Strong Buy 🚀",
-        4: "Buy 📈",
-        3: "Hold ⚖️",
-        2: "Sell 📉",
-        1: "Strong Sell 🔴",
-        0: "Strong Sell 🔴",
+        5: "🚀 Strong Buy (5)",
+        4: "📈 Buy (4)",
+        3: "⚖️ Hold (3)",
+        2: "📉 Sell (2)",
+        1: "🔴 Strong Sell (1)",
+        0: "🔴 Strong Sell (0)",
     }
     return mapping.get(score, "N/A")
 
@@ -110,7 +92,7 @@ def get_signal_text(score: int) -> str:
 tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
 
 if (
-    st.sidebar.button("🚀 Start Scan", type="primary")
+    st.sidebar.button("🚀 Start Multi-Timeframe Scan", type="primary")
     or "scanned" not in st.session_state
 ):
     st.session_state["scanned"] = True
@@ -119,42 +101,53 @@ if (
     progress_bar = st.progress(0)
     status_text = st.empty()
 
+    timeframes = [
+        ("1d", "60d", "1D"),
+        ("1h", "60d", "1H"),
+        ("15m", "7d", "15M"),
+    ]
+
     for i, ticker in enumerate(tickers):
-        status_text.text(f"Bezig met analyseren van {ticker}...")
-        try:
-            data = yf.download(
-                ticker,
-                period=period_choice,
-                interval=interval_choice,
-                progress=False,
-            )
+        status_text.text(
+            f"Bezig met analyseren van {ticker} (1D, 1H en 15M)..."
+        )
+        ticker_data = {"Ticker": ticker, "Prijs ($)": "N/A"}
+        total_score_sum = 0
 
-            if not data.empty and len(data) >= 20:
-                # Eventuele MultiIndex kolomstructuur platmaken
-                if isinstance(data.columns, pd.MultiIndex):
-                    data.columns = data.columns.get_level_values(0)
-
-                df = calculate_trading_score(data)
-                latest = df.iloc[-1]
-
-                score = int(latest["Score"])
-                signal = get_signal_text(score)
-
-                results.append(
-                    {
-                        "Ticker": ticker,
-                        "Prijs ($)": round(float(latest["Close"]), 2),
-                        "Score": score,
-                        "Signaal": signal,
-                        "Rule 1 (MA5>15)": "✅" if latest["Rule1"] == 1 else "❌",
-                        "Rule 2 (>VWAP)": "✅" if latest["Rule2"] == 1 else "❌",
-                        "Rule 3 (>Vol)": "✅" if latest["Rule3"] == 1 else "❌",
-                        "Rule 4 (>MA5)": "✅" if latest["Rule4"] == 1 else "❌",
-                        "Rule 5 (MA15 ↑)": "✅" if latest["Rule5"] == 1 else "❌",
-                    }
+        for interval, period, label in timeframes:
+            try:
+                data = yf.download(
+                    ticker, period=period, interval=interval, progress=False
                 )
-        except Exception as e:
-            st.error(f"Fout bij ophalen {ticker}: {e}")
+
+                if not data.empty and len(data) >= 20:
+                    if isinstance(data.columns, pd.MultiIndex):
+                        data.columns = data.columns.get_level_values(0)
+
+                    df = calculate_trading_score(data)
+                    latest = df.iloc[-1]
+
+                    score = int(latest["Score"])
+                    signal = get_signal_badge(score)
+
+                    # Update prijs
+                    ticker_data["Prijs ($)"] = round(float(latest["Close"]), 2)
+
+                    # Score en signaal per timeframe opslaan
+                    ticker_data[f"Score {label}"] = score
+                    ticker_data[f"Signaal {label}"] = signal
+                    total_score_sum += score
+                else:
+                    ticker_data[f"Score {label}"] = 0
+                    ticker_data[f"Signaal {label}"] = "Geen data"
+
+            except Exception as e:
+                ticker_data[f"Score {label}"] = 0
+                ticker_data[f"Signaal {label}"] = "Fout"
+
+        # Gemiddelde score voor sortering op totaalbeeld
+        ticker_data["Totale Matrix Score"] = total_score_sum
+        results.append(ticker_data)
 
         progress_bar.progress((i + 1) / len(tickers))
 
@@ -163,21 +156,29 @@ if (
 
     if results:
         res_df = pd.DataFrame(results).sort_values(
-            by="Score", ascending=False
+            by="Totale Matrix Score", ascending=False
         )
 
-        # Kleurstijlen voor tabelweergave
-        def highlight_score(val):
-            if val >= 4:
-                return "background-color: #28a745; color: white; font-weight: bold;"
-            elif val == 3:
-                return "background-color: #ffc107; color: black; font-weight: bold;"
-            else:
-                return "background-color: #dc3545; color: white; font-weight: bold;"
+        # Verwijder de hulpsorteerkolom
+        display_df = res_df.drop(columns=["Totale Matrix Score"])
 
-        st.subheader("📋 Overzicht Aandelen Scores")
+        # Kleurstijlen voor tabelweergave op alle score kolommen
+        def highlight_scores(val):
+            if isinstance(val, int):
+                if val >= 4:
+                    return "background-color: #28a745; color: white; font-weight: bold;"
+                elif val == 3:
+                    return "background-color: #ffc107; color: black; font-weight: bold;"
+                else:
+                    return "background-color: #dc3545; color: white; font-weight: bold;"
+            return ""
+
+        st.subheader("📋 Multi-Timeframe Score Overzicht")
         st.dataframe(
-            res_df.style.map(highlight_score, subset=["Score"]),
+            display_df.style.map(
+                highlight_scores,
+                subset=["Score 1D", "Score 1H", "Score 15M"],
+            ),
             use_container_width=True,
             hide_index=True,
         )
