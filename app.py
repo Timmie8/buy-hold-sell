@@ -14,7 +14,7 @@ st.set_page_config(
 
 st.title("📊 Multi-Timeframe Auto Trading Score Scanner")
 st.caption(
-    "Scant elk aandeel direct op 1 Dag (1D), 1 Uur (1H) en 15 Minuten (15M) volgens de exacte Pine Script logica."
+    "Scant elk aandeel direct op 1D, 1H en 15M (MA5/15 + VWAP + Volume), Stable RS Score (0-100) én 1m RVOL Score."
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -78,9 +78,8 @@ def calculate_trading_score(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def calculate_stable_rs_score(df_stock: pd.DataFrame, df_spy: pd.DataFrame, atr_max_pct: float = 3.0) -> int:
-    """Berekent de Stable Relative Strength Score (0 - 100) exact volgens het tweede Pine Script."""
+    """Berekent de Stable Relative Strength Score (0 - 100) exact volgens het Pine Script."""
     try:
-        # Synchroniseer datums van aandeel en SPY
         combined = pd.DataFrame({
             "stock_close": df_stock["Close"],
             "stock_high": df_stock["High"],
@@ -126,8 +125,7 @@ def calculate_stable_rs_score(df_stock: pd.DataFrame, df_spy: pd.DataFrame, atr_
         tr2 = (combined["stock_high"] - prev_close).abs()
         tr3 = (combined["stock_low"] - prev_close).abs()
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        
-        # Pine Script ta.atr(14) gebruikt RMA (Wilder Smoothing)
+
         atr14 = tr.ewm(alpha=1/14, adjust=False).mean()
         atr_val = atr14.iloc[-1]
         atr_pct = (atr_val / close_last) * 100
@@ -150,9 +148,52 @@ def calculate_stable_rs_score(df_stock: pd.DataFrame, df_spy: pd.DataFrame, atr_
         else:
             rvol_score = 0
 
-        # TOTAALSCORE (0 - 100)
         total_score = rs_score + trend_score + vol_score + rvol_score
         return int(total_score)
+
+    except Exception:
+        return 0
+
+
+# ─────────────────────────────────────────────────────────────
+# NIEUWE FUNCTIE: 1 MINUUT RVOL SCORE BEREKENING
+# ─────────────────────────────────────────────────────────────
+def calculate_1m_rvol_score(ticker: str) -> int:
+    """Ophaalt 1m data over de afgelopen dag en berekent de meest recente RVOL score."""
+    try:
+        df = yf.download(
+            ticker,
+            period="1d",
+            interval="1m",
+            auto_adjust=True,
+            progress=False
+        )
+
+        if df.empty or len(df) < 5:
+            return 0
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        # Gemiddeld volume
+        avg_volume = df["Volume"].mean()
+        if avg_volume == 0:
+            return 0
+
+        # RVOL op de meest recente 1-minuut bar
+        latest_vol = float(df["Volume"].iloc[-1])
+        rvol = latest_vol / avg_volume
+
+        # Score toewijzen exact volgens opgegeven regels
+        if rvol >= 3:
+            return 100
+        elif rvol >= 2:
+            return 75
+        elif rvol >= 1.5:
+            return 50
+        elif rvol >= 1:
+            return 25
+        return 0
 
     except Exception:
         return 0
@@ -163,7 +204,7 @@ def get_signal_badge(score: int) -> str:
     mapping = {
         5: "🚀 Strong Buy (5)",
         4: "📈 Buy (4)",
-        3: "⚖️️ Hold (3)",
+        3: "⚖️ Hold (3)",
         2: "📉 Sell (2)",
         1: "🔴 Strong Sell (1)",
         0: "🔴 Strong Sell (0)",
@@ -202,7 +243,7 @@ if (
 
     for i, ticker in enumerate(tickers):
         status_text.text(
-            f"Bezig met analyseren van {ticker} (1D, 1H, 15M & RS Score)..."
+            f"Bezig met analyseren van {ticker} (1D, 1H, 15M, RS Score & 1m RVOL)..."
         )
         ticker_data = {"Ticker": ticker, "Prijs ($)": "N/A"}
         total_score_sum = 0
@@ -242,12 +283,16 @@ if (
                 ticker_data[f"Score {label}"] = 0
                 ticker_data[f"Signaal {label}"] = "Fout"
 
-        # Bereken de Stable RS Score als laatste vakje/kolom
+        # Bereken de Stable RS Score
         if not stock_daily_df.empty and not spy_df_daily.empty:
             rs_score_val = calculate_stable_rs_score(stock_daily_df, spy_df_daily, ATR_MAX_PCT)
             ticker_data["RS Score (0-100)"] = rs_score_val
         else:
             ticker_data["RS Score (0-100)"] = 0
+
+        # Bereken de 1-minuut RVOL Score
+        rvol_1m_score = calculate_1m_rvol_score(ticker)
+        ticker_data["RVOL 1m Score"] = rvol_1m_score
 
         # Gemiddelde score voor sortering op totaalbeeld
         ticker_data["Totale Matrix Score"] = total_score_sum
@@ -287,11 +332,24 @@ if (
                     return "background-color: #dc3545; color: white; font-weight: bold;"
             return ""
 
+        def highlight_rvol_1m_score(val):
+            if isinstance(val, int):
+                if val >= 75:
+                    return "background-color: #28a745; color: white; font-weight: bold;"
+                elif val >= 50:
+                    return "background-color: #ffc107; color: black; font-weight: bold;"
+                elif val >= 25:
+                    return "background-color: #fd7e14; color: white; font-weight: bold;"
+                else:
+                    return "background-color: #dc3545; color: white; font-weight: bold;"
+            return ""
+
         st.subheader("📋 Multi-Timeframe Score Overzicht")
         st.dataframe(
             display_df.style
             .map(highlight_scores, subset=["Score 1D", "Score 1H", "Score 15M"])
-            .map(highlight_rs_score, subset=["RS Score (0-100)"]),
+            .map(highlight_rs_score, subset=["RS Score (0-100)"])
+            .map(highlight_rvol_1m_score, subset=["RVOL 1m Score"]),
             use_container_width=True,
             hide_index=True,
         )
