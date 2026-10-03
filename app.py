@@ -14,7 +14,7 @@ st.set_page_config(
 
 st.title("📊 Multi-Timeframe Auto Trading Score Scanner")
 st.caption(
-    "Scant elk aandeel direct op 1D, 1H en 15M (MA5/15 + VWAP + Volume), Stable RS Score (0-100) én Dagelijkse RVOL Score (1D vs 20D gemiddelde)."
+    "Scant elk aandeel direct op 1D, 1H en 15M (MA5/15 + VWAP + Volume), Stable RS Score (0-100), Dagelijkse RVOL Score én Volume Vergelijking vs 20-daags gemiddelde."
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -156,40 +156,47 @@ def calculate_stable_rs_score(df_stock: pd.DataFrame, df_spy: pd.DataFrame, atr_
 
 
 # ─────────────────────────────────────────────────────────────
-# BEREKENING: DAGELIJKE RVOL SCORE (1D VS 20D GEMIDDELD VOLUME)
+# BEREKENING: DAGELIJKE RVOL SCORE & VOLUME PERC VS GEMIDDELDE
 # ─────────────────────────────────────────────────────────────
-def calculate_daily_rvol_score(df_stock: pd.DataFrame) -> int:
+def calculate_daily_rvol_and_diff(df_stock: pd.DataFrame):
     """
-    Berekent de RVOL op dagniveau door het volume van de meest recente handelsdag
-    te vergelijken met het gemiddelde dagvolume van de afgelopen 20 handelsdagen.
+    Berekent de RVOL score én het percentage waarin het volume 
+    van vandaag afwijkt t.o.v. het 20-daags gemiddelde volume.
     """
     try:
         if len(df_stock) < 20:
-            return 0
+            return 0, "N/A"
 
         # 20-daags gemiddeld volume berekenen
         avg_vol_20d = df_stock["Volume"].rolling(window=20).mean().iloc[-1]
         latest_vol = float(df_stock["Volume"].iloc[-1])
 
         if avg_vol_20d == 0:
-            return 0
+            return 0, "N/A"
 
         # RVOL verhouding
         rvol = latest_vol / avg_vol_20d
 
         # Score toewijzen op basis van dagelijkse RVOL
         if rvol >= 3.0:
-            return 100
+            rvol_score = 100
         elif rvol >= 2.0:
-            return 75
+            rvol_score = 75
         elif rvol >= 1.5:
-            return 50
+            rvol_score = 50
         elif rvol >= 1.0:
-            return 25
-        return 0
+            rvol_score = 25
+        else:
+            rvol_score = 0
+
+        # Percentage verschil t.o.v. het 20-daags gemiddelde
+        diff_pct = ((latest_vol - avg_vol_20d) / avg_vol_20d) * 100
+        diff_str = f"{diff_pct:+.1f}%"
+
+        return rvol_score, diff_str
 
     except Exception:
-        return 0
+        return 0, "N/A"
 
 
 def get_signal_badge(score: int) -> str:
@@ -236,7 +243,7 @@ if (
 
     for i, ticker in enumerate(tickers):
         status_text.text(
-            f"Bezig met analyseren van {ticker} (1D, 1H, 15M, RS Score & Dagelijkse RVOL)..."
+            f"Bezig met analyseren van {ticker} (1D, 1H, 15M, RS Score & Volume)..."
         )
         ticker_data = {"Ticker": ticker, "Prijs ($)": "N/A"}
         total_score_sum = 0
@@ -283,12 +290,14 @@ if (
         else:
             ticker_data["RS Score (0-100)"] = 0
 
-        # Bereken de Dagelijkse RVOL Score (1D vs 20D gemiddelde)
+        # Bereken de Dagelijkse RVOL Score en Volume Afwijking %
         if not stock_daily_df.empty:
-            rvol_daily_score = calculate_daily_rvol_score(stock_daily_df)
+            rvol_daily_score, volume_diff = calculate_daily_rvol_and_diff(stock_daily_df)
             ticker_data["RVOL 1D Score"] = rvol_daily_score
+            ticker_data["Volume vs Gem. (1D)"] = volume_diff
         else:
             ticker_data["RVOL 1D Score"] = 0
+            ticker_data["Volume vs Gem. (1D)"] = "N/A"
 
         # Gemiddelde score voor sortering op totaalbeeld
         ticker_data["Totale Matrix Score"] = total_score_sum
@@ -340,12 +349,21 @@ if (
                     return "background-color: #dc3545; color: white; font-weight: bold;"
             return ""
 
+        def highlight_volume_diff(val):
+            if isinstance(val, str) and val.endswith("%"):
+                if val.startswith("+"):
+                    return "background-color: #28a745; color: white; font-weight: bold;"
+                elif val.startswith("-"):
+                    return "background-color: #dc3545; color: white; font-weight: bold;"
+            return ""
+
         st.subheader("📋 Multi-Timeframe Score Overzicht")
         st.dataframe(
             display_df.style
             .map(highlight_scores, subset=["Score 1D", "Score 1H", "Score 15M"])
             .map(highlight_rs_score, subset=["RS Score (0-100)"])
-            .map(highlight_rvol_score, subset=["RVOL 1D Score"]),
+            .map(highlight_rvol_score, subset=["RVOL 1D Score"])
+            .map(highlight_volume_diff, subset=["Volume vs Gem. (1D)"]),
             use_container_width=True,
             hide_index=True,
         )
