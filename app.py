@@ -14,7 +14,7 @@ st.set_page_config(
 
 st.title("📊 Multi-Timeframe Auto Trading Score Scanner")
 st.caption(
-    "Scant elk aandeel direct op 1D, 1H en 15M (MA5/15 + VWAP + Volume), Stable RS Score (0-100) én 1m RVOL Score."
+    "Scant elk aandeel direct op 1D, 1H en 15M (MA5/15 + VWAP + Volume), Stable RS Score (0-100) én Dagelijkse RVOL Score (1D vs 20D gemiddelde)."
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -156,42 +156,35 @@ def calculate_stable_rs_score(df_stock: pd.DataFrame, df_spy: pd.DataFrame, atr_
 
 
 # ─────────────────────────────────────────────────────────────
-# NIEUWE FUNCTIE: 1 MINUUT RVOL SCORE BEREKENING
+# BEREKENING: DAGELIJKE RVOL SCORE (1D VS 20D GEMIDDELD VOLUME)
 # ─────────────────────────────────────────────────────────────
-def calculate_1m_rvol_score(ticker: str) -> int:
-    """Ophaalt 1m data over de afgelopen dag en berekent de meest recente RVOL score."""
+def calculate_daily_rvol_score(df_stock: pd.DataFrame) -> int:
+    """
+    Berekent de RVOL op dagniveau door het volume van de meest recente handelsdag
+    te vergelijken met het gemiddelde dagvolume van de afgelopen 20 handelsdagen.
+    """
     try:
-        df = yf.download(
-            ticker,
-            period="1d",
-            interval="1m",
-            auto_adjust=True,
-            progress=False
-        )
-
-        if df.empty or len(df) < 5:
+        if len(df_stock) < 20:
             return 0
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        # 20-daags gemiddeld volume berekenen
+        avg_vol_20d = df_stock["Volume"].rolling(window=20).mean().iloc[-1]
+        latest_vol = float(df_stock["Volume"].iloc[-1])
 
-        # Gemiddeld volume
-        avg_volume = df["Volume"].mean()
-        if avg_volume == 0:
+        if avg_vol_20d == 0:
             return 0
 
-        # RVOL op de meest recente 1-minuut bar
-        latest_vol = float(df["Volume"].iloc[-1])
-        rvol = latest_vol / avg_volume
+        # RVOL verhouding
+        rvol = latest_vol / avg_vol_20d
 
-        # Score toewijzen exact volgens opgegeven regels
-        if rvol >= 3:
+        # Score toewijzen op basis van dagelijkse RVOL
+        if rvol >= 3.0:
             return 100
-        elif rvol >= 2:
+        elif rvol >= 2.0:
             return 75
         elif rvol >= 1.5:
             return 50
-        elif rvol >= 1:
+        elif rvol >= 1.0:
             return 25
         return 0
 
@@ -243,7 +236,7 @@ if (
 
     for i, ticker in enumerate(tickers):
         status_text.text(
-            f"Bezig met analyseren van {ticker} (1D, 1H, 15M, RS Score & 1m RVOL)..."
+            f"Bezig met analyseren van {ticker} (1D, 1H, 15M, RS Score & Dagelijkse RVOL)..."
         )
         ticker_data = {"Ticker": ticker, "Prijs ($)": "N/A"}
         total_score_sum = 0
@@ -290,9 +283,12 @@ if (
         else:
             ticker_data["RS Score (0-100)"] = 0
 
-        # Bereken de 1-minuut RVOL Score
-        rvol_1m_score = calculate_1m_rvol_score(ticker)
-        ticker_data["RVOL 1m Score"] = rvol_1m_score
+        # Bereken de Dagelijkse RVOL Score (1D vs 20D gemiddelde)
+        if not stock_daily_df.empty:
+            rvol_daily_score = calculate_daily_rvol_score(stock_daily_df)
+            ticker_data["RVOL 1D Score"] = rvol_daily_score
+        else:
+            ticker_data["RVOL 1D Score"] = 0
 
         # Gemiddelde score voor sortering op totaalbeeld
         ticker_data["Totale Matrix Score"] = total_score_sum
@@ -332,7 +328,7 @@ if (
                     return "background-color: #dc3545; color: white; font-weight: bold;"
             return ""
 
-        def highlight_rvol_1m_score(val):
+        def highlight_rvol_score(val):
             if isinstance(val, int):
                 if val >= 75:
                     return "background-color: #28a745; color: white; font-weight: bold;"
@@ -349,7 +345,7 @@ if (
             display_df.style
             .map(highlight_scores, subset=["Score 1D", "Score 1H", "Score 15M"])
             .map(highlight_rs_score, subset=["RS Score (0-100)"])
-            .map(highlight_rvol_1m_score, subset=["RVOL 1m Score"]),
+            .map(highlight_rvol_score, subset=["RVOL 1D Score"]),
             use_container_width=True,
             hide_index=True,
         )
