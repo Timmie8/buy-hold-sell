@@ -27,6 +27,10 @@ st.title("📈 AI Live Trading Dashboard & Multi-Timeframe Scanner")
 if has_ta_engine:
     analyzer = StockAnalyzer()
 
+# Session State initialisatie voor geselecteerde ticker
+if "selected_ticker" not in st.session_state:
+    st.session_state["selected_ticker"] = "AAPL"
+
 # ─────────────────────────────────────────────────────────────
 # SIDEBAR / INSTELLINGEN
 # ─────────────────────────────────────────────────────────────
@@ -40,7 +44,16 @@ ticker_input = st.sidebar.text_area(
 
 st.sidebar.markdown("---")
 st.sidebar.header("📊 Grafiek / AI Single Stock View")
-selected_ticker = st.sidebar.text_input("Gedetailleerde Analyse Ticker", value="AAPL").upper()
+
+# Ticker input synchroon houden met st.session_state
+manual_ticker = st.sidebar.text_input(
+    "Gedetailleerde Analyse Ticker", 
+    value=st.session_state["selected_ticker"]
+).upper()
+
+if manual_ticker != st.session_state["selected_ticker"]:
+    st.session_state["selected_ticker"] = manual_ticker
+
 timeframe = st.sidebar.selectbox("Timeframe Grafiek", options=["1d", "15m", "5m"], index=0)
 period = st.sidebar.selectbox("Historie Periode", options=["1y", "6mo", "1mo"], index=0)
 
@@ -184,7 +197,7 @@ def get_signal_badge(score: int) -> str:
     return mapping.get(score, "N/A")
 
 # ─────────────────────────────────────────────────────────────
-# SECTION 1: SCANNER TABEL BEREKENEN
+# SECTION 1: SCANNER TABEL BEREKENEN & INTERACTIE
 # ─────────────────────────────────────────────────────────────
 tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
 
@@ -280,7 +293,7 @@ if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or "scanne
             else:
                 style = "background-color: #dc3545; color: white; font-weight: bold;"
                 
-            if "⚠️️" in val_str:
+            if "⚠️" in val_str:
                 style += " border: 2px solid #ffcc00;"
             return style
 
@@ -315,27 +328,44 @@ if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or "scanne
             return ""
 
         st.subheader("📋 Multi-Timeframe Score Overzicht")
-        st.caption("⚠️ = RSI Breakout detectie op dit tijdsframe (> 55 gekruist)")
-        st.dataframe(
+        st.caption("💡 **Tip:** Klik op een regel in de tabel om de grafiek en AI-analyse eronder direct te laden.")
+        
+        styled_df = (
             display_df.style
             .map(highlight_scores, subset=["Score 1D", "Score 1H", "Score 15M"])
             .map(highlight_rs_score, subset=["RS Score (0-100)"])
             .map(highlight_rvol_score, subset=["RVOL 1D Score"])
-            .map(highlight_volume_diff, subset=["Volume vs Gem. (1D)"]),
+            .map(highlight_volume_diff, subset=["Volume vs Gem. (1D)"])
+        )
+
+        # INTERACTIE: st.dataframe verwerkt selecties en voert een rerun uit bij aanklikken
+        selected_event = st.dataframe(
+            styled_df,
             use_container_width=True,
             hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row"
         )
+
+        # Als de gebruiker op een rij klikt, de geselecteerde Ticker opslaan
+        if selected_event and selected_event.selection.rows:
+            selected_row_idx = selected_event.selection.rows[0]
+            clicked_ticker = display_df.iloc[selected_row_idx]["Ticker"]
+            if clicked_ticker != st.session_state["selected_ticker"]:
+                st.session_state["selected_ticker"] = clicked_ticker
+                st.rerun()
 
 # ─────────────────────────────────────────────────────────────
 # SECTION 2: AI LIVE TRADING DASHBOARD (GESELECTEERDE TICKER)
 # ─────────────────────────────────────────────────────────────
+selected_ticker = st.session_state["selected_ticker"]
+
 st.markdown("---")
 st.header(f"📊 AI Live Trading Dashboard: {selected_ticker}")
 
 if has_ta_engine:
     df_single = analyzer.get_stock_data(symbol=selected_ticker, timeframe=timeframe, period=period)
 else:
-    # Fallback m.b.v. yfinance
     df_single = yf.download(selected_ticker, period=period, interval=timeframe, progress=False)
     if not df_single.empty:
         if isinstance(df_single.columns, pd.MultiIndex):
@@ -354,7 +384,6 @@ else:
             use_grid_search=enable_grid_search
         )
     else:
-        # Dummy/Fallback waarden indien ta_engine niet lokaal is geïnstalleerd
         rsi_val = round(float(df_single["RSI"].iloc[-1]), 2) if "RSI" in df_single else 50.0
         close_val = float(df_single["Close"].iloc[-1])
         prev_close = float(df_single["Close"].iloc[-2]) if len(df_single) > 1 else close_val
