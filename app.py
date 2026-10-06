@@ -77,7 +77,7 @@ def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 def calculate_trading_score(df: pd.DataFrame) -> pd.DataFrame:
-    """Berekent de indicatoren en 5 regels exact zoals in Pine Script v5 + RSI Breakout."""
+    """Berekent de indicatoren en 5 regels exact zoals in Pine Script v5 + RSI Breakout + 10D Resistance."""
     df = df.copy()
     df.index = pd.to_datetime(df.index)
 
@@ -98,6 +98,10 @@ def calculate_trading_score(df: pd.DataFrame) -> pd.DataFrame:
 
     # RSI
     df["RSI"] = calculate_rsi(df["Close"], 14)
+
+    # 10 Dagen Resistance & 10% Ruimte
+    df["Res_10D"] = df["High"].rolling(window=10).max()
+    df["Res_10D_10Pct"] = df["Res_10D"] * 1.10
 
     # Regels
     df["Rule1"] = (df["EMA5"] > df["EMA15"]).astype(int)
@@ -338,7 +342,6 @@ if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or "scanne
             .map(highlight_volume_diff, subset=["Volume vs Gem. (1D)"])
         )
 
-        # INTERACTIE: st.dataframe verwerkt selecties en voert een rerun uit bij aanklikken
         selected_event = st.dataframe(
             styled_df,
             use_container_width=True,
@@ -347,7 +350,6 @@ if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or "scanne
             selection_mode="single-row"
         )
 
-        # Als de gebruiker op een rij klikt, de geselecteerde Ticker opslaan
         if selected_event and selected_event.selection.rows:
             selected_row_idx = selected_event.selection.rows[0]
             clicked_ticker = display_df.iloc[selected_row_idx]["Ticker"]
@@ -365,13 +367,14 @@ st.header(f"📊 AI Live Trading Dashboard: {selected_ticker}")
 
 if has_ta_engine:
     df_single = analyzer.get_stock_data(symbol=selected_ticker, timeframe=timeframe, period=period)
+    df_single = calculate_trading_score(df_single)
 else:
     df_single = yf.download(selected_ticker, period=period, interval=timeframe, progress=False)
     if not df_single.empty:
         if isinstance(df_single.columns, pd.MultiIndex):
             df_single.columns = df_single.columns.get_level_values(0)
         df_single["Timestamp"] = df_single.index
-        df_single["RSI"] = calculate_rsi(df_single["Close"])
+        df_single = calculate_trading_score(df_single)
 
 if df_single.empty:
     st.error(f"Geen data gevonden voor ticker '{selected_ticker}'. Controleer het symbool.")
@@ -404,6 +407,12 @@ else:
         }
         ml_res = {"up_prob": 50, "best_params": {}, "feature_importances": {"RSI": 1.0}}
 
+    # Berekening 10D weerstand en ruimte
+    latest_close = float(df_single["Close"].iloc[-1])
+    res_10d_val = float(df_single["Res_10D"].iloc[-1]) if "Res_10D" in df_single else latest_close
+    res_10d_10pct_val = float(df_single["Res_10D_10Pct"].iloc[-1]) if "Res_10D_10Pct" in df_single else latest_close * 1.10
+    dist_to_res_pct = ((res_10d_val - latest_close) / latest_close) * 100
+
     # 1. Status & kleur voor de RSI badge
     if signals.get('RSI_Overbought_Warning', False):
         rsi_status_text = f"OVERBOUGHT ({signals['RSI']})"
@@ -427,7 +436,7 @@ else:
 
     # 2. Live Dashboard Balk
     st.markdown("### 📊 Live Dashboard & Signalen")
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
 
     with m1:
         st.metric("Laatste Prijs", f"${signals['Price']:.2f}", f"{signals['Change_Pct']}%")
@@ -462,6 +471,9 @@ else:
         st.metric("Advies Signaal", signals['Action'])
 
     with m6:
+        st.metric("10D Resistance", f"${res_10d_val:.2f}", f"{dist_to_res_pct:+.1f}% tot top")
+
+    with m7:
         st.metric("🤖 ML Kans (+{f}d)".format(f=forecast_horizon), f"{ml_res['up_prob']}%")
 
     st.markdown("---")
@@ -483,6 +495,17 @@ else:
         low=df_single['Low'], close=df_single['Close'], name='Koers'
     ), row=1, col=1)
 
+    # 10D Resistance Lijn & 10% Zone Lijn toevoegen op de grafiek
+    fig.add_trace(go.Scatter(
+        x=x_axis, y=df_single['Res_10D'], mode='lines',
+        name='10D Resistance', line=dict(color='red', width=1.5, dash='dash')
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=x_axis, y=df_single['Res_10D_10Pct'], mode='lines',
+        name='10D Res +10% Zone', line=dict(color='orange', width=1.5, dash='dot')
+    ), row=1, col=1)
+
     # Volume
     fig.add_trace(go.Bar(
         x=x_axis, y=df_single['Volume'], name='Volume', 
@@ -499,7 +522,7 @@ else:
     fig.add_hline(y=55, line_dash="dash", line_color="green", annotation_text="Breakout (55)", row=3, col=1)
     fig.add_hline(y=30, line_dash="dot", line_color="green", row=3, col=1)
 
-    fig.update_layout(height=750, showlegend=False, xaxis_rangeslider_visible=False)
+    fig.update_layout(height=750, showlegend=True, xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
 
     # 4. ML Details & Onderbouwing
@@ -509,6 +532,8 @@ else:
         with st.expander("📋 Signaal Onderbouwing", expanded=True):
             for r in signals['Reasons']:
                 st.write(r)
+            st.write(f"- **10D Resistance:** ${res_10d_val:.2f}")
+            st.write(f"- **10D Resistance (+10% zone):** ${res_10d_10pct_val:.2f}")
 
     with col_ml:
         with st.expander("🤖 Machine Learning Model Details", expanded=True):
