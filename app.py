@@ -32,52 +32,86 @@ if "selected_ticker" not in st.session_state:
     st.session_state["selected_ticker"] = "AAPL"
 
 # ─────────────────────────────────────────────────────────────
-# SIDEBAR / INSTELLINGEN
+# CONSTANTEN
 # ─────────────────────────────────────────────────────────────
-st.sidebar.header("⚙️ Instellingen Scanner & Dashboard")
-
-# Ticker selectie voor de Scanner
-default_tickers = "AAPL, MSFT, NVDA, TSLA, AMZN, GOOGL, META, AMD, INTC, PLTR"
-ticker_input = st.sidebar.text_area(
-    "Scanner Tickers (gescheiden door komma)", default_tickers, height=100
-)
-
-st.sidebar.markdown("---")
-st.sidebar.header("📊 Grafiek / AI Single Stock View")
-
-# Ticker input synchroon houden met st.session_state
-manual_ticker = st.sidebar.text_input(
-    "Gedetailleerde Analyse Ticker", 
-    value=st.session_state["selected_ticker"]
-).upper()
-
-if manual_ticker != st.session_state["selected_ticker"]:
-    st.session_state["selected_ticker"] = manual_ticker
-
-timeframe = st.sidebar.selectbox("Timeframe Grafiek", options=["1d", "15m", "5m"], index=0)
-period = st.sidebar.selectbox("Historie Periode", options=["1y", "6mo", "1mo"], index=0)
-
-st.sidebar.markdown("---")
-st.sidebar.header("🤖 ML & Tuning")
-forecast_horizon = st.sidebar.slider("ML Voorspellingshorizon (candles)", 1, 10, 3)
-enable_grid_search = st.sidebar.checkbox("Schakel GridSearchCV in", value=True)
-
 SPY_TICKER = "SPY"
 ATR_MAX_PCT = 3.0
+REQUIRED_COLS = {"Open", "High", "Low", "Close", "Volume"}
+
+# yfinance limieten: welke periodes zijn geldig per interval?
+# (1m max 8 dagen, 5m/15m max 60 dagen, 1h max 730 dagen)
+INTERVAL_PERIODS = {
+    "1d":  ["1y", "6mo", "1mo"],
+    "1h":  ["60d", "1mo", "7d"],
+    "15m": ["1mo", "7d", "5d"],
+    "5m":  ["1mo", "7d", "5d"],
+    "1m":  ["7d", "5d", "1d"],
+}
 
 # ─────────────────────────────────────────────────────────────
-# BEREKENINGEN & INDICATOREN
+# HULPFUNCTIES
 # ─────────────────────────────────────────────────────────────
+def style_map(styler, func, subset=None):
+    """pandas >= 2.1 gebruikt Styler.map, oudere versies Styler.applymap."""
+    if hasattr(styler, "map"):
+        return styler.map(func, subset=subset)
+    return styler.applymap(func, subset=subset)
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Maakt van een MultiIndex-kolomstructuur (yfinance) platte kolommen."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def download_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    """Download met cache. Ongeldige combinaties geven een lege DataFrame."""
+    try:
+        df = yf.download(symbol, period=period, interval=interval, progress=False)
+        return normalize_columns(df)
+    except Exception:
+        return pd.DataFrame()
+
+
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Berekent de RSI indicator."""
+    """RSI met Wilder-smoothing (EMA alpha = 1/period), zoals TradingView."""
     delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    # GEEN replace(0, nan): bij avg_loss == 0 moet RSI 100 worden (alleen stijgingen),
+    # niet 50. Alleen 0/0 (geen beweging) wordt NaN -> 50.
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50.0)
 
-def calculate_trading_score(df: pd.DataFrame) -> pd.DataFrame:
-    """Berekent de indicatoren en 5 regels exact zoals in Pine Script v5 + RSI Breakout + 10D Resistance."""
+
+def calculate_trading_score(
+    df: pd.DataFrame,
+    interval: str = "1d",
+    res_lookback: int = 10,
+    vwap_rolling_days: int = 20,
+) -> pd.DataFrame:
+    """Indicatoren + 5 regels (Pine Script v5 stijl) + RSI breakout + weerstandslijn.
+
+    - VWAP: echte sessie-VWAP op intraday. Op dagdata is er geen sessie-VWAP
+      (elke candle = 1 sessie, dan is VWAP altijd gelijk aan HLC3), daarom
+      gebruiken we op dagdata een rollend VWAP over `vwap_rolling_days` dagen.
+    - Weerstand: rollend maximum over `res_lookback` *candles* (niet dagen!).
+    """
+    if df is None or df.empty:
+        raise ValueError("Geen data om indicatoren op te berekenen.")
+
+    missing = REQUIRED_COLS - set(df.columns)
+    if missing:
+        raise ValueError(f"Kolommen ontbreken in de data: {sorted(missing)}")
+
     df = df.copy()
     df.index = pd.to_datetime(df.index)
 
@@ -88,10 +122,17 @@ def calculate_trading_score(df: pd.DataFrame) -> pd.DataFrame:
     # VWAP
     df["HLC3"] = (df["High"] + df["Low"] + df["Close"]) / 3
     df["PV"] = df["HLC3"] * df["Volume"]
-    dates = df.index.date
-    cum_pv = df.groupby(dates)["PV"].cumsum()
-    cum_vol = df.groupby(dates)["Volume"].cumsum()
-    df["VWAP"] = np.where(cum_vol != 0, cum_pv / cum_vol, df["HLC3"])
+    is_daily = interval.lower() in ("1d", "1wk", "1mo")
+    if is_daily:
+        # Rollend VWAP over N dagen (sessie-VWAP bestaat niet op dagdata)
+        roll_pv = df["PV"].rolling(window=vwap_rolling_days, min_periods=1).sum()
+        roll_vol = df["Volume"].rolling(window=vwap_rolling_days, min_periods=1).sum()
+        df["VWAP"] = np.where(roll_vol != 0, roll_pv / roll_vol, df["HLC3"])
+    else:
+        dates = df.index.date
+        cum_pv = df.groupby(dates)["PV"].cumsum()
+        cum_vol = df.groupby(dates)["Volume"].cumsum()
+        df["VWAP"] = np.where(cum_vol != 0, cum_pv / cum_vol, df["HLC3"])
 
     # Volume SMA 20
     df["VolSMA20"] = df["Volume"].rolling(window=20).mean()
@@ -99,9 +140,9 @@ def calculate_trading_score(df: pd.DataFrame) -> pd.DataFrame:
     # RSI
     df["RSI"] = calculate_rsi(df["Close"], 14)
 
-    # 10 Dagen Resistance & 10% Ruimte
-    df["Res_10D"] = df["High"].rolling(window=10).max()
-    df["Res_10D_10Pct"] = df["Res_10D"] * 1.10
+    # Weerstand over N candles + 10% ruimte
+    df["Res_ND"] = df["High"].rolling(window=res_lookback, min_periods=1).max()
+    df["Res_ND_10Pct"] = df["Res_ND"] * 1.10
 
     # Regels
     df["Rule1"] = (df["EMA5"] > df["EMA15"]).astype(int)
@@ -117,6 +158,7 @@ def calculate_trading_score(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
 def calculate_stable_rs_score(df_stock: pd.DataFrame, df_spy: pd.DataFrame, atr_max_pct: float = 3.0) -> int:
     """Berekent de Stable Relative Strength Score (0 - 100)."""
     try:
@@ -125,7 +167,7 @@ def calculate_stable_rs_score(df_stock: pd.DataFrame, df_spy: pd.DataFrame, atr_
             "stock_high": df_stock["High"],
             "stock_low": df_stock["Low"],
             "stock_volume": df_stock["Volume"],
-            "spy_close": df_spy["Close"]
+            "spy_close": df_spy["Close"],
         }).dropna()
 
         if len(combined) < 22:
@@ -155,7 +197,7 @@ def calculate_stable_rs_score(df_stock: pd.DataFrame, df_spy: pd.DataFrame, atr_
         tr3 = (combined["stock_low"] - prev_close).abs()
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-        atr14 = tr.ewm(alpha=1/14, adjust=False).mean()
+        atr14 = tr.ewm(alpha=1 / 14, adjust=False).mean()
         atr_pct = (atr14.iloc[-1] / close_last) * 100
 
         vol_score = 25 if atr_pct <= atr_max_pct else (15 if atr_pct <= (atr_max_pct + 1.5) else 0)
@@ -168,6 +210,7 @@ def calculate_stable_rs_score(df_stock: pd.DataFrame, df_spy: pd.DataFrame, atr_
     except Exception:
         return 0
 
+
 def calculate_daily_rvol_and_diff(df_stock: pd.DataFrame):
     """Berekent de RVOL score en de afwijking t.o.v. het 20-daags gemiddelde."""
     try:
@@ -177,7 +220,7 @@ def calculate_daily_rvol_and_diff(df_stock: pd.DataFrame):
         avg_vol_20d = df_stock["Volume"].rolling(window=20).mean().iloc[-1]
         latest_vol = float(df_stock["Volume"].iloc[-1])
 
-        if avg_vol_20d == 0:
+        if not np.isfinite(avg_vol_20d) or avg_vol_20d == 0:
             return 0, "N/A"
 
         rvol = latest_vol / avg_vol_20d
@@ -187,6 +230,7 @@ def calculate_daily_rvol_and_diff(df_stock: pd.DataFrame):
         return rvol_score, f"{diff_pct:+.1f}%"
     except Exception:
         return 0, "N/A"
+
 
 def get_signal_badge(score: int) -> str:
     """Vertaalt de score naar een compact signaal."""
@@ -200,68 +244,109 @@ def get_signal_badge(score: int) -> str:
     }
     return mapping.get(score, "N/A")
 
-# ─────────────────────────────────────────────────────────────
-# SECTION 1: SCANNER TABEL BEREKENEN & INTERACTIE
-# ─────────────────────────────────────────────────────────────
-tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
 
-if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or "scanned" not in st.session_state:
-    st.session_state["scanned"] = True
-    results = []
+def fallback_ml_probability(df: pd.DataFrame, horizon: int = 3):
+    """Interne fallback (logistische regressie) als ta_engine.py ontbreekt.
 
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
+    Geeft géén verzonnen cijfers: bij te weinig data komt er None terug.
+    """
+    empty = {"up_prob": None, "feature_importances": {}, "best_params": {},
+             "note": "Onvoldoende data of sklearn ontbreekt voor de interne fallback."}
     try:
-        spy_df_daily = yf.download(SPY_TICKER, period="60d", interval="1d", progress=False)
-        if isinstance(spy_df_daily.columns, pd.MultiIndex):
-            spy_df_daily.columns = spy_df_daily.columns.get_level_values(0)
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
     except Exception:
-        spy_df_daily = pd.DataFrame()
+        return empty
+
+    feat = pd.DataFrame(index=df.index)
+    feat["RSI"] = df["RSI"]
+    feat["EMA5_EMA15"] = (df["EMA5"] - df["EMA15"]) / df["Close"]
+    feat["Boven_VWAP"] = (df["Close"] > df["VWAP"]).astype(int)
+    feat["Volume_Ratio"] = df["Volume"] / df["VolSMA20"]
+    feat["Rendement_1"] = df["Close"].pct_change()
+    feat["Rendement_5"] = df["Close"].pct_change(5)
+
+    target = (df["Close"].shift(-horizon) > df["Close"]).astype(int)
+
+    # Trainen op rijen MET label (de laatste `horizon` rijen hebben geen label)
+    train = feat.copy()
+    train["_y"] = target
+    train = train.replace([np.inf, -np.inf], np.nan).dropna()
+
+    # Voorspellen op de ECHT laatste candle (die heeft per definitie geen label)
+    latest_row = feat.replace([np.inf, -np.inf], np.nan).dropna()
+
+    if len(train) < 60 or train["_y"].nunique() < 2 or latest_row.empty:
+        return empty
+
+    X, y = train.drop(columns="_y"), train["_y"]
+    split = max(int(len(train) * 0.8), 30)
+    if split >= len(train):
+        split = len(train) - 1
+
+    model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
+    model.fit(X.iloc[:split], y.iloc[:split])
+
+    prob = float(model.predict_proba(latest_row.iloc[[-1]])[0][1])
+    coefs = np.abs(model[-1].coef_[0])
+    total = coefs.sum() if coefs.sum() > 0 else 1.0
+    importances = {col: round(float(c / total), 3) for col, c in zip(X.columns, coefs)}
+
+    return {
+        "up_prob": int(round(prob * 100)),
+        "feature_importances": importances,
+        "best_params": {},
+        "note": "Interne fallback (logistische regressie) — ta_engine.py niet geladen.",
+    }
+
+
+def run_scan(tickers, res_lookback, atr_max_pct, progress_cb=None) -> pd.DataFrame:
+    """Voert de multi-timeframe scan uit en geeft een DataFrame terug."""
+    spy_df_daily = download_data(SPY_TICKER, "60d", "1d")
 
     timeframes = [("1d", "60d", "1D"), ("1h", "60d", "1H"), ("15m", "7d", "15M")]
+    results = []
 
     for i, ticker_item in enumerate(tickers):
-        status_text.text(f"Bezig met analyseren van {ticker_item}...")
+        if progress_cb:
+            progress_cb(i, len(tickers), ticker_item)
+
         ticker_data = {"Ticker": ticker_item, "Prijs ($)": "N/A"}
         total_score_sum = 0
         stock_daily_df = pd.DataFrame()
 
         for interval, period_tf, label in timeframes:
-            try:
-                data = yf.download(ticker_item, period=period_tf, interval=interval, progress=False)
+            data = download_data(ticker_item, period_tf, interval)
 
-                if not data.empty and len(data) >= 20:
-                    if isinstance(data.columns, pd.MultiIndex):
-                        data.columns = data.columns.get_level_values(0)
+            if not data.empty and len(data) >= 20:
+                if interval == "1d":
+                    stock_daily_df = data.copy()
 
-                    if interval == "1d":
-                        stock_daily_df = data.copy()
-
-                    df_calc = calculate_trading_score(data)
-                    latest = df_calc.iloc[-1]
-
-                    score_val = int(latest["Score"])
-                    
-                    # Controleer op RSI Breakout
-                    rsi_breakout = latest.get("RSI_Cross_55", False) or (latest.get("RSI", 0) > 55 and df_calc["RSI"].iloc[-2] <= 55)
-                    
-                    # Gele driehoek toevoegen bij breakout
-                    score_display = f"⚠️ {score_val}" if rsi_breakout else f"{score_val}"
-
-                    ticker_data["Prijs ($)"] = round(float(latest["Close"]), 2)
-                    ticker_data[f"Score {label}"] = score_display
-                    ticker_data[f"Signaal {label}"] = get_signal_badge(score_val)
-                    total_score_sum += score_val
-                else:
+                try:
+                    df_calc = calculate_trading_score(data, interval=interval, res_lookback=res_lookback)
+                except ValueError:
                     ticker_data[f"Score {label}"] = "0"
-                    ticker_data[f"Signaal {label}"] = "Geen data"
-            except Exception:
+                    ticker_data[f"Signaal {label}"] = "Fout"
+                    continue
+
+                latest = df_calc.iloc[-1]
+                score_val = int(latest["Score"])
+
+                # RSI breakout (> 55 en net gekruist)
+                rsi_breakout = bool(latest.get("RSI_Cross_55", False))
+                score_display = f"⚠️ {score_val}" if rsi_breakout else f"{score_val}"
+
+                ticker_data["Prijs ($)"] = round(float(latest["Close"]), 2)
+                ticker_data[f"Score {label}"] = score_display
+                ticker_data[f"Signaal {label}"] = get_signal_badge(score_val)
+                total_score_sum += score_val
+            else:
                 ticker_data[f"Score {label}"] = "0"
-                ticker_data[f"Signaal {label}"] = "Fout"
+                ticker_data[f"Signaal {label}"] = "Geen data"
 
         if not stock_daily_df.empty and not spy_df_daily.empty:
-            ticker_data["RS Score (0-100)"] = calculate_stable_rs_score(stock_daily_df, spy_df_daily, ATR_MAX_PCT)
+            ticker_data["RS Score (0-100)"] = calculate_stable_rs_score(stock_daily_df, spy_daily_df := spy_df_daily, atr_max_pct)
         else:
             ticker_data["RS Score (0-100)"] = 0
 
@@ -276,85 +361,181 @@ if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or "scanne
         ticker_data["Totale Matrix Score"] = total_score_sum
         results.append(ticker_data)
 
-        progress_bar.progress((i + 1) / len(tickers))
+    if not results:
+        return pd.DataFrame()
+
+    res_df = pd.DataFrame(results).sort_values(by="Totale Matrix Score", ascending=False)
+    return res_df.drop(columns=["Totale Matrix Score"]).reset_index(drop=True)
+
+
+def highlight_scores(val):
+    val_str = str(val)
+    clean = val_str.replace("⚠️", "").strip()
+    clean_val = int(clean) if clean.isdigit() else 0
+
+    if clean_val >= 4:
+        style = "background-color: #28a745; color: white; font-weight: bold;"
+    elif clean_val == 3:
+        style = "background-color: #ffc107; color: black; font-weight: bold;"
+    else:
+        style = "background-color: #dc3545; color: white; font-weight: bold;"
+
+    if "⚠️" in val_str:
+        style += " border: 2px solid #ffcc00;"
+    return style
+
+
+def _is_int(val) -> bool:
+    """Werkt ook voor numpy-int types (isinstance(np.int64, int) is False)."""
+    return isinstance(val, (int, np.integer)) and not isinstance(val, bool)
+
+
+def highlight_rs_score(val):
+    if _is_int(val):
+        if val >= 70:
+            return "background-color: #28a745; color: white; font-weight: bold;"
+        elif val >= 50:
+            return "background-color: #fd7e14; color: white; font-weight: bold;"
+        else:
+            return "background-color: #dc3545; color: white; font-weight: bold;"
+    return ""
+
+
+def highlight_rvol_score(val):
+    if _is_int(val):
+        if val >= 75:
+            return "background-color: #28a745; color: white; font-weight: bold;"
+        elif val >= 50:
+            return "background-color: #ffc107; color: black; font-weight: bold;"
+        elif val >= 25:
+            return "background-color: #fd7e14; color: white; font-weight: bold;"
+        else:
+            return "background-color: #dc3545; color: white; font-weight: bold;"
+    return ""
+
+
+def highlight_volume_diff(val):
+    if isinstance(val, str) and val.endswith("%"):
+        if val.startswith("+"):
+            return "background-color: #28a745; color: white; font-weight: bold;"
+        elif val.startswith("-"):
+            return "background-color: #dc3545; color: white; font-weight: bold;"
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────
+# SIDEBAR / INSTELLINGEN
+# ─────────────────────────────────────────────────────────────
+st.sidebar.header("⚙️ Instellingen Scanner & Dashboard")
+
+default_tickers = "AAPL, MSFT, NVDA, TSLA, AMZN, GOOGL, META, AMD, INTC, PLTR"
+ticker_input = st.sidebar.text_area(
+    "Scanner Tickers (gescheiden door komma)", default_tickers, height=100
+)
+
+st.sidebar.markdown("---")
+st.sidebar.header("📊 Grafiek / AI Single Stock View")
+
+# Ticker input synchroon houden met st.session_state (key = bron van waarheid)
+if "selected_ticker" not in st.session_state:
+    st.session_state["selected_ticker"] = "AAPL"
+
+# BELANGRIJK: de widget-key mag NIET dezelfde zijn als de sessie-key die we
+# elders programmatisch aanpassen (rij-klik). Anders geeft Streamlit:
+# StreamlitWidgetAlreadyInstantiatedError.
+if "ticker_widget" not in st.session_state:
+    st.session_state["ticker_widget"] = st.session_state["selected_ticker"]
+
+# Na een rij-klik: het tekstveld bijwerken VÓÓR de widget bestaat
+if st.session_state.pop("_apply_clicked_ticker", False):
+    st.session_state["ticker_widget"] = st.session_state["selected_ticker"]
+
+st.sidebar.text_input("Gedetailleerde Analyse Ticker", key="ticker_widget")
+
+if st.session_state["ticker_widget"].strip().upper() != st.session_state["selected_ticker"]:
+    st.session_state["selected_ticker"] = st.session_state["ticker_widget"].strip().upper()
+
+# Timeframe eerst, periode-opties daarop aanpassen (voorkomt ongeldige combinaties)
+timeframe = st.sidebar.selectbox("Timeframe Grafiek", options=["1d", "1h", "15m", "5m"], index=0)
+valid_periods = INTERVAL_PERIODS.get(timeframe, ["1y", "6mo", "1mo"])
+period = st.sidebar.selectbox("Historie Periode", options=valid_periods, index=0)
+st.sidebar.caption(
+    f"ℹ️ yfinance-limiet: voor interval **{timeframe}** is **{valid_periods[0]}** "
+    f"de langste geldige periode."
+)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🤖 ML & Tuning")
+forecast_horizon = st.sidebar.slider("ML Voorspellingshorizon (candles)", 1, 10, 3)
+enable_grid_search = st.sidebar.checkbox("Schakel GridSearchCV in", value=True)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🎯 Indicatoren")
+res_lookback = st.sidebar.number_input(
+    "Weerstand lookback (candles)", min_value=5, max_value=100, value=10, step=1,
+    help="Let op: dit zijn CANDLES. Op 15m is 10 candles maar 2,5 uur, op 1D zijn het 10 handelsdagen.",
+)
+vwap_rolling_days = st.sidebar.number_input(
+    "VWAP rollend venster op dagdata (dagen)", min_value=5, max_value=60, value=20, step=1,
+)
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 1: SCANNER TABEL BEREKENEN & INTERACTIE
+# ─────────────────────────────────────────────────────────────
+tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
+
+# Auto-scan bij de allereerste load (net als in de originele code), maar met
+# caching en opgeslagen in session_state zodat hij na een rerun niet verdwijnt.
+if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or not st.session_state.get("scanned", False):
+    progress_bar = st.progress(0.0)
+    status_text = st.empty()
+
+    def _cb(i, total, tkr):
+        status_text.text(f"Bezig met analyseren van {tkr}...")
+        progress_bar.progress((i + 1) / total)
+
+    try:
+        st.session_state["scan_results"] = run_scan(tickers, res_lookback, ATR_MAX_PCT, progress_cb=_cb)
+        st.session_state["scanned"] = True
+    except Exception as e:
+        st.session_state["scan_results"] = pd.DataFrame()
+        st.session_state["scanned"] = True
+        st.sidebar.error(f"Scan mislukt: {e}")
 
     status_text.empty()
     progress_bar.empty()
 
-    if results:
-        res_df = pd.DataFrame(results).sort_values(by="Totale Matrix Score", ascending=False)
-        display_df = res_df.drop(columns=["Totale Matrix Score"])
+# Resultaten blijven bewaard in session_state, zodat de tabel na een rerun
+# (bijv. na een rij-klik) niet verdwijnt.
+scan_results = st.session_state.get("scan_results")
 
-        def highlight_scores(val):
-            val_str = str(val)
-            clean_val = int(val_str.replace("⚠️", "").strip()) if val_str.replace("⚠️", "").strip().isdigit() else 0
-            
-            style = ""
-            if clean_val >= 4:
-                style = "background-color: #28a745; color: white; font-weight: bold;"
-            elif clean_val == 3:
-                style = "background-color: #ffc107; color: black; font-weight: bold;"
-            else:
-                style = "background-color: #dc3545; color: white; font-weight: bold;"
-                
-            if "⚠️" in val_str:
-                style += " border: 2px solid #ffcc00;"
-            return style
-
-        def highlight_rs_score(val):
-            if isinstance(val, int):
-                if val >= 70:
-                    return "background-color: #28a745; color: white; font-weight: bold;"
-                elif val >= 50:
-                    return "background-color: #fd7e14; color: white; font-weight: bold;"
-                else:
-                    return "background-color: #dc3545; color: white; font-weight: bold;"
-            return ""
-
-        def highlight_rvol_score(val):
-            if isinstance(val, int):
-                if val >= 75:
-                    return "background-color: #28a745; color: white; font-weight: bold;"
-                elif val >= 50:
-                    return "background-color: #ffc107; color: black; font-weight: bold;"
-                elif val >= 25:
-                    return "background-color: #fd7e14; color: white; font-weight: bold;"
-                else:
-                    return "background-color: #dc3545; color: white; font-weight: bold;"
-            return ""
-
-        def highlight_volume_diff(val):
-            if isinstance(val, str) and val.endswith("%"):
-                if val.startswith("+"):
-                    return "background-color: #28a745; color: white; font-weight: bold;"
-                elif val.startswith("-"):
-                    return "background-color: #dc3545; color: white; font-weight: bold;"
-            return ""
-
+if st.session_state.get("scanned") and scan_results is not None:
+    if scan_results.empty:
+        st.warning("Geen resultaten. Controleer de tickers en probeer opnieuw.")
+    else:
         st.subheader("📋 Multi-Timeframe Score Overzicht")
         st.caption("💡 **Tip:** Klik op een regel in de tabel om de grafiek en AI-analyse eronder direct te laden.")
-        
-        styled_df = (
-            display_df.style
-            .map(highlight_scores, subset=["Score 1D", "Score 1H", "Score 15M"])
-            .map(highlight_rs_score, subset=["RS Score (0-100)"])
-            .map(highlight_rvol_score, subset=["RVOL 1D Score"])
-            .map(highlight_volume_diff, subset=["Volume vs Gem. (1D)"])
-        )
+
+        styler = scan_results.style
+        styler = style_map(styler, highlight_scores, subset=["Score 1D", "Score 1H", "Score 15M"])
+        styler = style_map(styler, highlight_rs_score, subset=["RS Score (0-100)"])
+        styler = style_map(styler, highlight_rvol_score, subset=["RVOL 1D Score"])
+        styler = style_map(styler, highlight_volume_diff, subset=["Volume vs Gem. (1D)"])
 
         selected_event = st.dataframe(
-            styled_df,
-            use_container_width=True,
+            styler,
+            width="stretch",
             hide_index=True,
             on_select="rerun",
-            selection_mode="single-row"
+            selection_mode="single-row",
+            key="scan_table",
         )
 
         if selected_event and selected_event.selection.rows:
-            selected_row_idx = selected_event.selection.rows[0]
-            clicked_ticker = display_df.iloc[selected_row_idx]["Ticker"]
+            clicked_ticker = scan_results.iloc[selected_event.selection.rows[0]]["Ticker"]
             if clicked_ticker != st.session_state["selected_ticker"]:
                 st.session_state["selected_ticker"] = clicked_ticker
+                st.session_state["_apply_clicked_ticker"] = True  # tekstveld bijwerken op rerun
                 st.rerun()
 
 # ─────────────────────────────────────────────────────────────
@@ -365,32 +546,38 @@ selected_ticker = st.session_state["selected_ticker"]
 st.markdown("---")
 st.header(f"📊 AI Live Trading Dashboard: {selected_ticker}")
 
+# Eerst data ophalen, DAN pas indicatoren berekenen (voorkomt crash op lege data)
 if has_ta_engine:
-    df_single = analyzer.get_stock_data(symbol=selected_ticker, timeframe=timeframe, period=period)
-    df_single = calculate_trading_score(df_single)
+    try:
+        df_single = analyzer.get_stock_data(symbol=selected_ticker, timeframe=timeframe, period=period)
+        df_single = normalize_columns(df_single)
+    except Exception as e:
+        df_single = pd.DataFrame()
+        st.warning(f"ta_engine kon geen data ophalen: {e}")
 else:
-    df_single = yf.download(selected_ticker, period=period, interval=timeframe, progress=False)
+    df_single = download_data(selected_ticker, period, timeframe)
     if not df_single.empty:
-        if isinstance(df_single.columns, pd.MultiIndex):
-            df_single.columns = df_single.columns.get_level_values(0)
         df_single["Timestamp"] = df_single.index
-        df_single = calculate_trading_score(df_single)
 
 if df_single.empty:
-    st.error(f"Geen data gevonden voor ticker '{selected_ticker}'. Controleer het symbool.")
+    st.error(f"Geen data gevonden voor ticker '{selected_ticker}' op {timeframe}/{period}. Controleer het symbool.")
 else:
+    df_single = calculate_trading_score(
+        df_single, interval=timeframe, res_lookback=int(res_lookback), vwap_rolling_days=int(vwap_rolling_days)
+    )
+
     if has_ta_engine:
         signals = analyzer.evaluate_signals(df_single)
         ml_res = analyzer.predict_ml_probability(
-            df_single, 
-            forecast_horizon=forecast_horizon, 
-            use_grid_search=enable_grid_search
+            df_single,
+            forecast_horizon=forecast_horizon,
+            use_grid_search=enable_grid_search,
         )
     else:
-        rsi_val = round(float(df_single["RSI"].iloc[-1]), 2) if "RSI" in df_single else 50.0
+        rsi_val = round(float(df_single["RSI"].iloc[-1]), 2)
         close_val = float(df_single["Close"].iloc[-1])
         prev_close = float(df_single["Close"].iloc[-2]) if len(df_single) > 1 else close_val
-        change_pct = round(((close_val - prev_close) / prev_close) * 100, 2)
+        change_pct = round(((close_val - prev_close) / prev_close) * 100, 2) if prev_close else 0.0
 
         signals = {
             "Price": close_val,
@@ -399,31 +586,31 @@ else:
             "RSI_Overbought_Warning": rsi_val > 70 and df_single["RSI"].iloc[-1] < df_single["RSI"].iloc[-2],
             "RSI_Stijgend_Boven_70": rsi_val > 70 and df_single["RSI"].iloc[-1] >= df_single["RSI"].iloc[-2],
             "RSI_Above_55": rsi_val > 55,
-            "RSI_Cross_55": rsi_val > 55 and df_single["RSI"].iloc[-2] <= 55,
+            "RSI_Cross_55": bool(df_single["RSI_Cross_55"].iloc[-1]),
             "STO_Status": "N/A",
             "MACD_Status": "N/A",
             "Action": "NEUTRAAL",
-            "Reasons": ["Geen ta_engine.py geladen, basis yfinance analyse gebruikt."]
+            "Reasons": ["Geen ta_engine.py geladen, basis yfinance analyse gebruikt."],
         }
-        ml_res = {"up_prob": 50, "best_params": {}, "feature_importances": {"RSI": 1.0}}
+        ml_res = fallback_ml_probability(df_single, forecast_horizon)
 
-    # Berekening 10D weerstand en ruimte
+    # Berekening weerstand en ruimte
     latest_close = float(df_single["Close"].iloc[-1])
-    res_10d_val = float(df_single["Res_10D"].iloc[-1]) if "Res_10D" in df_single else latest_close
-    res_10d_10pct_val = float(df_single["Res_10D_10Pct"].iloc[-1]) if "Res_10D_10Pct" in df_single else latest_close * 1.10
-    dist_to_res_pct = ((res_10d_val - latest_close) / latest_close) * 100
+    res_val = float(df_single["Res_ND"].iloc[-1]) if "Res_ND" in df_single else latest_close
+    res_10pct_val = float(df_single["Res_ND_10Pct"].iloc[-1]) if "Res_ND_10Pct" in df_single else latest_close * 1.10
+    dist_to_res_pct = ((res_val - latest_close) / latest_close) * 100 if latest_close else 0.0
 
     # 1. Status & kleur voor de RSI badge
-    if signals.get('RSI_Overbought_Warning', False):
+    if signals.get("RSI_Overbought_Warning", False):
         rsi_status_text = f"OVERBOUGHT ({signals['RSI']})"
         bg_color = "#FF4B4B"
         text_color = "#FFFFFF"
-    elif signals.get('RSI_Stijgend_Boven_70', False):
+    elif signals.get("RSI_Stijgend_Boven_70", False):
         rsi_status_text = f"🚀 STRONG > 70 ({signals['RSI']})"
         bg_color = "#28A745"
         text_color = "#FFFFFF"
-    elif signals.get('RSI_Above_55', False):
-        if signals.get('RSI_Cross_55', False):
+    elif signals.get("RSI_Above_55", False):
+        if signals.get("RSI_Cross_55", False):
             rsi_status_text = f"🔥 BREAKOUT > 55 ({signals['RSI']})"
         else:
             rsi_status_text = f"BULLISH > 55 ({signals['RSI']})"
@@ -458,64 +645,70 @@ else:
                 {rsi_status_text}
             </div>
             """,
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
 
     with m3:
-        st.metric("Slow-STO", signals['STO_Status'])
+        st.metric("Slow-STO", signals.get("STO_Status", "N/A"))
 
     with m4:
-        st.metric("MACD", signals['MACD_Status'])
+        st.metric("MACD", signals.get("MACD_Status", "N/A"))
 
     with m5:
-        st.metric("Advies Signaal", signals['Action'])
+        st.metric("Advies Signaal", signals.get("Action", "N/A"))
 
     with m6:
-        st.metric("10D Resistance", f"${res_10d_val:.2f}", f"{dist_to_res_pct:+.1f}% tot top")
+        st.metric(f"Weerstand ({int(res_lookback)} candles)", f"${res_val:.2f}", f"{dist_to_res_pct:+.1f}% tot top")
 
     with m7:
-        st.metric("🤖 ML Kans (+{f}d)".format(f=forecast_horizon), f"{ml_res['up_prob']}%")
+        prob = ml_res.get("up_prob")
+        st.metric(
+            f"🤖 ML Kans (+{forecast_horizon}d)",
+            f"{prob}%" if prob is not None else "N/A",
+        )
 
     st.markdown("---")
 
     # 3. Technische Grafiek & Indicatoren
     fig = make_subplots(
-        rows=3, cols=1, 
-        shared_xaxes=True, 
-        vertical_spacing=0.03, 
-        subplot_titles=('Koers & Candlesticks', 'Volume', 'RSI Indicator'),
-        row_width=[0.2, 0.2, 0.6]
+        rows=3, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        subplot_titles=("Koers & Candlesticks", "Volume", "RSI Indicator"),
+        row_width=[0.2, 0.2, 0.6],
     )
 
-    x_axis = df_single['Timestamp'] if 'Timestamp' in df_single else df_single.index
+    x_axis = df_single["Timestamp"] if "Timestamp" in df_single else df_single.index
 
-    # Candlesticks
     fig.add_trace(go.Candlestick(
-        x=x_axis, open=df_single['Open'], high=df_single['High'], 
-        low=df_single['Low'], close=df_single['Close'], name='Koers'
-    ), row=1, col=1)
-
-    # 10D Resistance Lijn & 10% Zone Lijn toevoegen op de grafiek
-    fig.add_trace(go.Scatter(
-        x=x_axis, y=df_single['Res_10D'], mode='lines',
-        name='10D Resistance', line=dict(color='red', width=1.5, dash='dash')
+        x=x_axis, open=df_single["Open"], high=df_single["High"],
+        low=df_single["Low"], close=df_single["Close"], name="Koers",
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
-        x=x_axis, y=df_single['Res_10D_10Pct'], mode='lines',
-        name='10D Res +10% Zone', line=dict(color='orange', width=1.5, dash='dot')
+        x=x_axis, y=df_single["VWAP"], mode="lines",
+        name=f"VWAP ({'rollend ' + str(int(vwap_rolling_days)) + 'd' if timeframe == '1d' else 'sessie'})",
+        line=dict(color="blue", width=1.2),
     ), row=1, col=1)
 
-    # Volume
+    fig.add_trace(go.Scatter(
+        x=x_axis, y=df_single["Res_ND"], mode="lines",
+        name=f"Weerstand ({int(res_lookback)} candles)",
+        line=dict(color="red", width=1.5, dash="dash"),
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=x_axis, y=df_single["Res_ND_10Pct"], mode="lines",
+        name="Weerstand +10% zone",
+        line=dict(color="orange", width=1.5, dash="dot"),
+    ), row=1, col=1)
+
     fig.add_trace(go.Bar(
-        x=x_axis, y=df_single['Volume'], name='Volume', 
-        marker_color='lightblue'
+        x=x_axis, y=df_single["Volume"], name="Volume", marker_color="lightblue",
     ), row=2, col=1)
 
-    # RSI + Hulplijnen (30, 55, 70)
     fig.add_trace(go.Scatter(
-        x=x_axis, y=df_single['RSI'], mode='lines', 
-        name='RSI', line=dict(color='purple')
+        x=x_axis, y=df_single["RSI"], mode="lines", name="RSI", line=dict(color="purple"),
     ), row=3, col=1)
 
     fig.add_hline(y=70, line_dash="dot", line_color="red", row=3, col=1)
@@ -523,31 +716,36 @@ else:
     fig.add_hline(y=30, line_dash="dot", line_color="green", row=3, col=1)
 
     fig.update_layout(height=750, showlegend=True, xaxis_rangeslider_visible=False)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # 4. ML Details & Onderbouwing
     col_reasons, col_ml = st.columns(2)
 
     with col_reasons:
         with st.expander("📋 Signaal Onderbouwing", expanded=True):
-            for r in signals['Reasons']:
+            for r in signals.get("Reasons", []):
                 st.write(r)
-            st.write(f"- **10D Resistance:** ${res_10d_val:.2f}")
-            st.write(f"- **10D Resistance (+10% zone):** ${res_10d_10pct_val:.2f}")
+            st.write(f"- **Weerstand ({int(res_lookback)} candles):** ${res_val:.2f}")
+            st.write(f"- **Weerstand +10% zone:** ${res_10pct_val:.2f}")
+            st.write(f"- **VWAP:** ${float(df_single['VWAP'].iloc[-1]):.2f}")
 
     with col_ml:
         with st.expander("🤖 Machine Learning Model Details", expanded=True):
-            st.write(f"**Voorspelde kans op prijsstijging:** `{ml_res['up_prob']}%`")
-            st.progress(ml_res['up_prob'] / 100)
+            prob = ml_res.get("up_prob")
+            if prob is None:
+                st.info(ml_res.get("note", "Geen ML-voorspelling beschikbaar."))
+            else:
+                st.write(f"**Voorspelde kans op prijsstijging:** `{prob}%`")
+                st.progress(prob / 100)
 
-            if enable_grid_search and "best_params" in ml_res and ml_res["best_params"]:
+            if enable_grid_search and ml_res.get("best_params"):
                 st.markdown("**Gevonden Optimale Parameters (GridSearch):**")
                 st.json(ml_res["best_params"])
 
-            if 'feature_importances' in ml_res:
+            if ml_res.get("feature_importances"):
                 st.markdown("**Top Gewichten Indicatoren:**")
                 feat_df = pd.DataFrame(
-                    list(ml_res['feature_importances'].items()), 
-                    columns=['Indicator', 'Gewicht']
-                ).sort_values(by='Gewicht', ascending=False)
-                st.dataframe(feat_df.head(4), use_container_width=True, hide_index=True)
+                    list(ml_res["feature_importances"].items()),
+                    columns=["Indicator", "Gewicht"],
+                ).sort_values(by="Gewicht", ascending=False)
+                st.dataframe(feat_df.head(4), width="stretch", hide_index=True)
