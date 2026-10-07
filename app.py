@@ -38,8 +38,7 @@ SPY_TICKER = "SPY"
 ATR_MAX_PCT = 3.0
 REQUIRED_COLS = {"Open", "High", "Low", "Close", "Volume"}
 
-# yfinance limieten: welke periodes zijn geldig per interval?
-# (1m max 8 dagen, 5m/15m max 60 dagen, 1h max 730 dagen)
+# yfinance limieten
 INTERVAL_PERIODS = {
     "1d":  ["1y", "6mo", "1mo"],
     "1h":  ["60d", "1mo", "7d"],
@@ -79,14 +78,12 @@ def download_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
 
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """RSI met Wilder-smoothing (EMA alpha = 1/period), zoals TradingView."""
+    """RSI met Wilder-smoothing (EMA alpha = 1/period)."""
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
     avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    # GEEN replace(0, nan): bij avg_loss == 0 moet RSI 100 worden (alleen stijgingen),
-    # niet 50. Alleen 0/0 (geen beweging) wordt NaN -> 50.
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50.0)
@@ -98,13 +95,7 @@ def calculate_trading_score(
     res_lookback: int = 10,
     vwap_rolling_days: int = 20,
 ) -> pd.DataFrame:
-    """Indicatoren + 5 regels (Pine Script v5 stijl) + RSI breakout + weerstandslijn.
-
-    - VWAP: echte sessie-VWAP op intraday. Op dagdata is er geen sessie-VWAP
-      (elke candle = 1 sessie, dan is VWAP altijd gelijk aan HLC3), daarom
-      gebruiken we op dagdata een rollend VWAP over `vwap_rolling_days` dagen.
-    - Weerstand: rollend maximum over `res_lookback` *candles* (niet dagen!).
-    """
+    """Indicatoren + Slow Stochastic + MACD + RSI breakout en regels."""
     if df is None or df.empty:
         raise ValueError("Geen data om indicatoren op te berekenen.")
 
@@ -124,7 +115,6 @@ def calculate_trading_score(
     df["PV"] = df["HLC3"] * df["Volume"]
     is_daily = interval.lower() in ("1d", "1wk", "1mo")
     if is_daily:
-        # Rollend VWAP over N dagen (sessie-VWAP bestaat niet op dagdata)
         roll_pv = df["PV"].rolling(window=vwap_rolling_days, min_periods=1).sum()
         roll_vol = df["Volume"].rolling(window=vwap_rolling_days, min_periods=1).sum()
         df["VWAP"] = np.where(roll_vol != 0, roll_pv / roll_vol, df["HLC3"])
@@ -139,6 +129,21 @@ def calculate_trading_score(
 
     # RSI
     df["RSI"] = calculate_rsi(df["Close"], 14)
+
+    # --- SLOW STOCHASTIC (14, 3, 3) ---
+    low_14 = df["Low"].rolling(window=14).min()
+    high_14 = df["High"].rolling(window=14).max()
+    fast_k = 100 * ((df["Close"] - low_14) / (high_14 - low_14).replace(0, np.nan))
+    df["Slow_K"] = fast_k.rolling(window=3).mean().fillna(50.0)  # %K
+    df["Slow_D"] = df["Slow_K"].rolling(window=3).mean().fillna(50.0)  # %D
+    df["Slow_Sto_Bullish"] = df["Slow_K"] > df["Slow_D"]
+
+    # --- MACD (12, 26, 9) ---
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_Bullish"] = df["MACD"] > df["MACD_Signal"]
 
     # Weerstand over N candles + 10% ruimte
     df["Res_ND"] = df["High"].rolling(window=res_lookback, min_periods=1).max()
@@ -246,10 +251,6 @@ def get_signal_badge(score: int) -> str:
 
 
 def fallback_ml_probability(df: pd.DataFrame, horizon: int = 3):
-    """Interne fallback (logistische regressie) als ta_engine.py ontbreekt.
-
-    Geeft géén verzonnen cijfers: bij te weinig data komt er None terug.
-    """
     empty = {"up_prob": None, "feature_importances": {}, "best_params": {},
              "note": "Onvoldoende data of sklearn ontbreekt voor de interne fallback."}
     try:
@@ -269,12 +270,10 @@ def fallback_ml_probability(df: pd.DataFrame, horizon: int = 3):
 
     target = (df["Close"].shift(-horizon) > df["Close"]).astype(int)
 
-    # Trainen op rijen MET label (de laatste `horizon` rijen hebben geen label)
     train = feat.copy()
     train["_y"] = target
     train = train.replace([np.inf, -np.inf], np.nan).dropna()
 
-    # Voorspellen op de ECHT laatste candle (die heeft per definitie geen label)
     latest_row = feat.replace([np.inf, -np.inf], np.nan).dropna()
 
     if len(train) < 60 or train["_y"].nunique() < 2 or latest_row.empty:
@@ -302,7 +301,6 @@ def fallback_ml_probability(df: pd.DataFrame, horizon: int = 3):
 
 
 def run_scan(tickers, res_lookback, atr_max_pct, progress_cb=None) -> pd.DataFrame:
-    """Voert de multi-timeframe scan uit en geeft een DataFrame terug."""
     spy_df_daily = download_data(SPY_TICKER, "60d", "1d")
 
     timeframes = [("1d", "60d", "1D"), ("1h", "60d", "1H"), ("15m", "7d", "15M")]
@@ -333,7 +331,6 @@ def run_scan(tickers, res_lookback, atr_max_pct, progress_cb=None) -> pd.DataFra
                 latest = df_calc.iloc[-1]
                 score_val = int(latest["Score"])
 
-                # RSI breakout (> 55 en net gekruist)
                 rsi_breakout = bool(latest.get("RSI_Cross_55", False))
                 score_display = f"⚠️ {score_val}" if rsi_breakout else f"{score_val}"
 
@@ -346,7 +343,7 @@ def run_scan(tickers, res_lookback, atr_max_pct, progress_cb=None) -> pd.DataFra
                 ticker_data[f"Signaal {label}"] = "Geen data"
 
         if not stock_daily_df.empty and not spy_df_daily.empty:
-            ticker_data["RS Score (0-100)"] = calculate_stable_rs_score(stock_daily_df, spy_daily_df := spy_df_daily, atr_max_pct)
+            ticker_data["RS Score (0-100)"] = calculate_stable_rs_score(stock_daily_df, spy_df_daily, atr_max_pct)
         else:
             ticker_data["RS Score (0-100)"] = 0
 
@@ -386,7 +383,6 @@ def highlight_scores(val):
 
 
 def _is_int(val) -> bool:
-    """Werkt ook voor numpy-int types (isinstance(np.int64, int) is False)."""
     return isinstance(val, (int, np.integer)) and not isinstance(val, bool)
 
 
@@ -436,17 +432,12 @@ ticker_input = st.sidebar.text_area(
 st.sidebar.markdown("---")
 st.sidebar.header("📊 Grafiek / AI Single Stock View")
 
-# Ticker input synchroon houden met st.session_state (key = bron van waarheid)
 if "selected_ticker" not in st.session_state:
     st.session_state["selected_ticker"] = "AAPL"
 
-# BELANGRIJK: de widget-key mag NIET dezelfde zijn als de sessie-key die we
-# elders programmatisch aanpassen (rij-klik). Anders geeft Streamlit:
-# StreamlitWidgetAlreadyInstantiatedError.
 if "ticker_widget" not in st.session_state:
     st.session_state["ticker_widget"] = st.session_state["selected_ticker"]
 
-# Na een rij-klik: het tekstveld bijwerken VÓÓR de widget bestaat
 if st.session_state.pop("_apply_clicked_ticker", False):
     st.session_state["ticker_widget"] = st.session_state["selected_ticker"]
 
@@ -455,7 +446,6 @@ st.sidebar.text_input("Gedetailleerde Analyse Ticker", key="ticker_widget")
 if st.session_state["ticker_widget"].strip().upper() != st.session_state["selected_ticker"]:
     st.session_state["selected_ticker"] = st.session_state["ticker_widget"].strip().upper()
 
-# Timeframe eerst, periode-opties daarop aanpassen (voorkomt ongeldige combinaties)
 timeframe = st.sidebar.selectbox("Timeframe Grafiek", options=["1d", "1h", "15m", "5m"], index=0)
 valid_periods = INTERVAL_PERIODS.get(timeframe, ["1y", "6mo", "1mo"])
 period = st.sidebar.selectbox("Historie Periode", options=valid_periods, index=0)
@@ -473,7 +463,6 @@ st.sidebar.markdown("---")
 st.sidebar.header("🎯 Indicatoren")
 res_lookback = st.sidebar.number_input(
     "Weerstand lookback (candles)", min_value=5, max_value=100, value=10, step=1,
-    help="Let op: dit zijn CANDLES. Op 15m is 10 candles maar 2,5 uur, op 1D zijn het 10 handelsdagen.",
 )
 vwap_rolling_days = st.sidebar.number_input(
     "VWAP rollend venster op dagdata (dagen)", min_value=5, max_value=60, value=20, step=1,
@@ -484,8 +473,6 @@ vwap_rolling_days = st.sidebar.number_input(
 # ─────────────────────────────────────────────────────────────
 tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
 
-# Auto-scan bij de allereerste load (net als in de originele code), maar met
-# caching en opgeslagen in session_state zodat hij na een rerun niet verdwijnt.
 if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or not st.session_state.get("scanned", False):
     progress_bar = st.progress(0.0)
     status_text = st.empty()
@@ -505,8 +492,6 @@ if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or not st.
     status_text.empty()
     progress_bar.empty()
 
-# Resultaten blijven bewaard in session_state, zodat de tabel na een rerun
-# (bijv. na een rij-klik) niet verdwijnt.
 scan_results = st.session_state.get("scan_results")
 
 if st.session_state.get("scanned") and scan_results is not None:
@@ -535,7 +520,7 @@ if st.session_state.get("scanned") and scan_results is not None:
             clicked_ticker = scan_results.iloc[selected_event.selection.rows[0]]["Ticker"]
             if clicked_ticker != st.session_state["selected_ticker"]:
                 st.session_state["selected_ticker"] = clicked_ticker
-                st.session_state["_apply_clicked_ticker"] = True  # tekstveld bijwerken op rerun
+                st.session_state["_apply_clicked_ticker"] = True
                 st.rerun()
 
 # ─────────────────────────────────────────────────────────────
@@ -546,7 +531,6 @@ selected_ticker = st.session_state["selected_ticker"]
 st.markdown("---")
 st.header(f"📊 AI Live Trading Dashboard: {selected_ticker}")
 
-# Eerst data ophalen, DAN pas indicatoren berekenen (voorkomt crash op lege data)
 if has_ta_engine:
     try:
         df_single = analyzer.get_stock_data(symbol=selected_ticker, timeframe=timeframe, period=period)
@@ -574,10 +558,46 @@ else:
             use_grid_search=enable_grid_search,
         )
     else:
+        # Uitlezen van indicatoren en hun status op de laatste candle
         rsi_val = round(float(df_single["RSI"].iloc[-1]), 2)
+        slow_k = float(df_single["Slow_K"].iloc[-1])
+        slow_d = float(df_single["Slow_D"].iloc[-1])
+        macd = float(df_single["MACD"].iloc[-1])
+        macd_signal = float(df_single["MACD_Signal"].iloc[-1])
+
+        # Bepalen van individuele indicator trends
+        rsi_bullish = rsi_val > 50
+        rsi_breakout = rsi_val > 55
+        slow_sto_bullish = bool(df_single["Slow_Sto_Bullish"].iloc[-1])
+        macd_bullish = bool(df_single["MACD_Bullish"].iloc[-1])
+
+        # Hulpvariabelen voor statustekst
+        sto_status_str = f"🟢 BULLISH ({slow_k:.1f})" if slow_sto_bullish else f"🔴 BEARISH ({slow_k:.1f})"
+        macd_status_str = f"🟢 BULLISH" if macd_bullish else f"🔴 BEARISH"
+
         close_val = float(df_single["Close"].iloc[-1])
         prev_close = float(df_single["Close"].iloc[-2]) if len(df_single) > 1 else close_val
         change_pct = round(((close_val - prev_close) / prev_close) * 100, 2) if prev_close else 0.0
+
+        # --- NIEUWE LOGICA VOOR SIGNAAL ---
+        # BUY = RSI, Slow-Sto en MACD zijn ALLE DRIE Bullish
+        # STRONG BUY = BUY geldt EN RSI breekt boven 55
+        reasons = []
+        if rsi_bullish and slow_sto_bullish and macd_bullish:
+            if rsi_breakout:
+                action_signal = "🚀 STRONG BUY"
+                reasons.append("RSI (>55 Breakout), Slow-STO (%K > %D) en MACD zijn allemaal BULLISH!")
+            else:
+                action_signal = "📈 BUY"
+                reasons.append("RSI (>50), Slow-STO (%K > %D) en MACD zijn allemaal BULLISH.")
+        else:
+            action_signal = "NEUTRAAL / NO TRADE"
+            if not rsi_bullish:
+                reasons.append("RSI is nog niet bullish (<= 50).")
+            if not slow_sto_bullish:
+                reasons.append("Slow Stochastic is bearish (%K < %D).")
+            if not macd_bullish:
+                reasons.append("MACD is bearish (MACD < Signal).")
 
         signals = {
             "Price": close_val,
@@ -585,12 +605,12 @@ else:
             "RSI": rsi_val,
             "RSI_Overbought_Warning": rsi_val > 70 and df_single["RSI"].iloc[-1] < df_single["RSI"].iloc[-2],
             "RSI_Stijgend_Boven_70": rsi_val > 70 and df_single["RSI"].iloc[-1] >= df_single["RSI"].iloc[-2],
-            "RSI_Above_55": rsi_val > 55,
+            "RSI_Above_55": rsi_breakout,
             "RSI_Cross_55": bool(df_single["RSI_Cross_55"].iloc[-1]),
-            "STO_Status": "N/A",
-            "MACD_Status": "N/A",
-            "Action": "NEUTRAAL",
-            "Reasons": ["Geen ta_engine.py geladen, basis yfinance analyse gebruikt."],
+            "STO_Status": sto_status_str,
+            "MACD_Status": macd_status_str,
+            "Action": action_signal,
+            "Reasons": reasons,
         }
         ml_res = fallback_ml_probability(df_single, forecast_horizon)
 
