@@ -424,7 +424,7 @@ def highlight_volume_diff(val):
 # ─────────────────────────────────────────────────────────────
 st.sidebar.header("⚙️ Instellingen Scanner & Dashboard")
 
-default_tickers = "AAPL, MSFT, NVDA, TSLA, AMZN, GOOGL, META, AMD, INTC, PLTR"
+default_tickers = "AAPL, MSFT, NVDA, TSLA, AMZN, GOOGL, META, AMD, INTC, PLTR, QDEL"
 ticker_input = st.sidebar.text_area(
     "Scanner Tickers (gescheiden door komma)", default_tickers, height=100
 )
@@ -580,8 +580,6 @@ else:
         change_pct = round(((close_val - prev_close) / prev_close) * 100, 2) if prev_close else 0.0
 
         # --- NIEUWE LOGICA VOOR SIGNAAL ---
-        # BUY = RSI, Slow-Sto en MACD zijn ALLE DRIE Bullish
-        # STRONG BUY = BUY geldt EN RSI breekt boven 55
         reasons = []
         if rsi_bullish and slow_sto_bullish and macd_bullish:
             if rsi_breakout:
@@ -614,11 +612,19 @@ else:
         }
         ml_res = fallback_ml_probability(df_single, forecast_horizon)
 
-    # Berekening weerstand en ruimte
+    # ─────────────────────────────────────────────────────────────
+    # INSTELLINGEN/BEREKENING VASTE WEERSTANDSLIJN (Bv. QDEL op $15.50)
+    # ─────────────────────────────────────────────────────────────
     latest_close = float(df_single["Close"].iloc[-1])
-    res_val = float(df_single["Res_ND"].iloc[-1]) if "Res_ND" in df_single else latest_close
-    res_10pct_val = float(df_single["Res_ND_10Pct"].iloc[-1]) if "Res_ND_10Pct" in df_single else latest_close * 1.10
+
+    if selected_ticker == "QDEL":
+        res_val = 15.50
+    else:
+        res_val = float(df_single["Res_ND"].iloc[-1]) if "Res_ND" in df_single else latest_close
+
+    # Percentage berekenen van huidige prijs naar weerstandslijn
     dist_to_res_pct = ((res_val - latest_close) / latest_close) * 100 if latest_close else 0.0
+    res_10pct_val = res_val * 1.10
 
     # 1. Status & kleur voor de RSI badge
     if signals.get("RSI_Overbought_Warning", False):
@@ -678,7 +684,7 @@ else:
         st.metric("Advies Signaal", signals.get("Action", "N/A"))
 
     with m6:
-        st.metric(f"Weerstand ({int(res_lookback)} candles)", f"${res_val:.2f}", f"{dist_to_res_pct:+.1f}% tot top")
+        st.metric("Weerstand Lijn", f"${res_val:.2f}", f"{dist_to_res_pct:+.1f}% tot top")
 
     with m7:
         prob = ml_res.get("up_prob")
@@ -711,17 +717,27 @@ else:
         line=dict(color="blue", width=1.2),
     ), row=1, col=1)
 
-    fig.add_trace(go.Scatter(
-        x=x_axis, y=df_single["Res_ND"], mode="lines",
-        name=f"Weerstand ({int(res_lookback)} candles)",
-        line=dict(color="red", width=1.5, dash="dash"),
-    ), row=1, col=1)
+    # RECHTE HORIZONTALE WEERSTANDSLIJN + PERCENTAGE ANNOTATIE
+    fig.add_hline(
+        y=res_val,
+        line_dash="dash",
+        line_color="red",
+        line_width=2,
+        annotation_text=f"Weerstand ${res_val:.2f} ({dist_to_res_pct:+.1f}%)",
+        annotation_position="top right",
+        row=1, col=1,
+    )
 
-    fig.add_trace(go.Scatter(
-        x=x_axis, y=df_single["Res_ND_10Pct"], mode="lines",
-        name="Weerstand +10% zone",
-        line=dict(color="orange", width=1.5, dash="dot"),
-    ), row=1, col=1)
+    # RECHTE HORIZONTALE WEERSTAND +10% ZONE LIJN
+    fig.add_hline(
+        y=res_10pct_val,
+        line_dash="dot",
+        line_color="orange",
+        line_width=1.5,
+        annotation_text=f"Weerstand +10% (${res_10pct_val:.2f})",
+        annotation_position="top right",
+        row=1, col=1,
+    )
 
     fig.add_trace(go.Bar(
         x=x_axis, y=df_single["Volume"], name="Volume", marker_color="lightblue",
@@ -745,7 +761,7 @@ else:
         with st.expander("📋 Signaal Onderbouwing", expanded=True):
             for r in signals.get("Reasons", []):
                 st.write(r)
-            st.write(f"- **Weerstand ({int(res_lookback)} candles):** ${res_val:.2f}")
+            st.write(f"- **Vaste Weerstand:** ${res_val:.2f} (Afstand: {dist_to_res_pct:+.2f}%)")
             st.write(f"- **Weerstand +10% zone:** ${res_10pct_val:.2f}")
             st.write(f"- **VWAP:** ${float(df_single['VWAP'].iloc[-1]):.2f}")
 
