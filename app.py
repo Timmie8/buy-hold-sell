@@ -164,6 +164,33 @@ def calculate_trading_score(
     return df
 
 
+def get_trading_signal(rsi_val, slow_k, slow_d, macd, macd_signal):
+    """Berekent het advies signaal op basis van RSI, Slow Stochastic en MACD."""
+    rsi_bullish = rsi_val > 50
+    rsi_breakout = rsi_val > 55
+    slow_sto_bullish = slow_k > slow_d
+    macd_bullish = macd > macd_signal
+
+    reasons = []
+    if rsi_bullish and slow_sto_bullish and macd_bullish:
+        if rsi_breakout:
+            action_signal = "🚀 STRONG BUY"
+            reasons.append("RSI (>55 Breakout), Slow-STO (%K > %D) en MACD zijn allemaal BULLISH!")
+        else:
+            action_signal = "📈 BUY"
+            reasons.append("RSI (>50), Slow-STO (%K > %D) en MACD zijn allemaal BULLISH.")
+    else:
+        action_signal = "NEUTRAAL / NO TRADE"
+        if not rsi_bullish:
+            reasons.append("RSI is nog niet bullish (<= 50).")
+        if not slow_sto_bullish:
+            reasons.append("Slow Stochastic is bearish (%K < %D).")
+        if not macd_bullish:
+            reasons.append("MACD is bearish (MACD < Signal).")
+
+    return action_signal, reasons
+
+
 def calculate_stable_rs_score(df_stock: pd.DataFrame, df_spy: pd.DataFrame, atr_max_pct: float = 3.0) -> int:
     """Berekent de Stable Relative Strength Score (0 - 100)."""
     try:
@@ -318,15 +345,15 @@ def run_scan(tickers, res_lookback, atr_max_pct, progress_cb=None) -> pd.DataFra
             data = download_data(ticker_item, period_tf, interval)
 
             if not data.empty and len(data) >= 20:
-                if interval == "1d":
-                    stock_daily_df = data.copy()
-
                 try:
                     df_calc = calculate_trading_score(data, interval=interval, res_lookback=res_lookback)
                 except ValueError:
                     ticker_data[f"Score {label}"] = "0"
                     ticker_data[f"Signaal {label}"] = "Fout"
                     continue
+
+                if interval == "1d":
+                    stock_daily_df = df_calc.copy()
 
                 latest = df_calc.iloc[-1]
                 score_val = int(latest["Score"])
@@ -342,13 +369,27 @@ def run_scan(tickers, res_lookback, atr_max_pct, progress_cb=None) -> pd.DataFra
                 ticker_data[f"Score {label}"] = "0"
                 ticker_data[f"Signaal {label}"] = "Geen data"
 
+        # --- ADVIES SIGNAAL (OP BASIS VAN DAGLEVEL INDICATOREN) ---
+        if not stock_daily_df.empty:
+            d_last = stock_daily_df.iloc[-1]
+            advies_sig, _ = get_trading_signal(
+                rsi_val=float(d_last["RSI"]),
+                slow_k=float(d_last["Slow_K"]),
+                slow_d=float(d_last["Slow_D"]),
+                macd=float(d_last["MACD"]),
+                macd_signal=float(d_last["MACD_Signal"]),
+            )
+            ticker_data["Advies Signaal"] = advies_sig
+        else:
+            ticker_data["Advies Signaal"] = "Geen data"
+
         # --- WEERSTAND SCORE TOT DE TOP BEREKENING (OP DAGLEVEL) ---
         if not stock_daily_df.empty:
             if ticker_item == "QDEL":
                 res_val = 15.50
             else:
                 res_val = float(stock_daily_df["High"].rolling(window=res_lookback, min_periods=1).max().iloc[-1])
-            
+
             latest_close = float(stock_daily_df["Close"].iloc[-1])
             dist_to_res_pct = ((res_val - latest_close) / latest_close) * 100 if latest_close else 0.0
             ticker_data["Weerstand tot top"] = f"{dist_to_res_pct:+.1f}%"
@@ -444,6 +485,18 @@ def highlight_resistance(val):
     return ""
 
 
+def highlight_advies_signaal(val):
+    """Kleurt de advies-signaal cel op basis van het type signaal."""
+    val_str = str(val)
+    if "STRONG BUY" in val_str:
+        return "background-color: #28a745; color: white; font-weight: bold;"
+    elif "BUY" in val_str:
+        return "background-color: #17a2b8; color: white; font-weight: bold;"
+    elif "NO TRADE" in val_str or "NEUTRAAL" in val_str:
+        return "background-color: #6c757d; color: white; font-weight: bold;"
+    return ""
+
+
 # ─────────────────────────────────────────────────────────────
 # SIDEBAR / INSTELLINGEN
 # ─────────────────────────────────────────────────────────────
@@ -532,6 +585,7 @@ if st.session_state.get("scanned") and scan_results is not None:
         styler = style_map(styler, highlight_rvol_score, subset=["RVOL 1D Score"])
         styler = style_map(styler, highlight_volume_diff, subset=["Volume vs Gem. (1D)"])
         styler = style_map(styler, highlight_resistance, subset=["Weerstand tot top"])
+        styler = style_map(styler, highlight_advies_signaal, subset=["Advies Signaal"])
 
         selected_event = st.dataframe(
             styler,
@@ -594,8 +648,8 @@ else:
         # Bepalen van individuele indicator trends
         rsi_bullish = rsi_val > 50
         rsi_breakout = rsi_val > 55
-        slow_sto_bullish = bool(df_single["Slow_Sto_Bullish"].iloc[-1])
-        macd_bullish = bool(df_single["MACD_Bullish"].iloc[-1])
+        slow_sto_bullish = slow_k > slow_d
+        macd_bullish = macd > macd_signal
 
         # Hulpvariabelen voor statustekst
         sto_status_str = f"🟢 BULLISH ({slow_k:.1f})" if slow_sto_bullish else f"🔴 BEARISH ({slow_k:.1f})"
@@ -605,23 +659,8 @@ else:
         prev_close = float(df_single["Close"].iloc[-2]) if len(df_single) > 1 else close_val
         change_pct = round(((close_val - prev_close) / prev_close) * 100, 2) if prev_close else 0.0
 
-        # --- NIEUWE LOGICA VOOR SIGNAAL ---
-        reasons = []
-        if rsi_bullish and slow_sto_bullish and macd_bullish:
-            if rsi_breakout:
-                action_signal = "🚀 STRONG BUY"
-                reasons.append("RSI (>55 Breakout), Slow-STO (%K > %D) en MACD zijn allemaal BULLISH!")
-            else:
-                action_signal = "📈 BUY"
-                reasons.append("RSI (>50), Slow-STO (%K > %D) en MACD zijn allemaal BULLISH.")
-        else:
-            action_signal = "NEUTRAAL / NO TRADE"
-            if not rsi_bullish:
-                reasons.append("RSI is nog niet bullish (<= 50).")
-            if not slow_sto_bullish:
-                reasons.append("Slow Stochastic is bearish (%K < %D).")
-            if not macd_bullish:
-                reasons.append("MACD is bearish (MACD < Signal).")
+        # Berekening via centrale hulpfunctie
+        action_signal, reasons = get_trading_signal(rsi_val, slow_k, slow_d, macd, macd_signal)
 
         signals = {
             "Price": close_val,
