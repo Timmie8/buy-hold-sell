@@ -342,6 +342,19 @@ def run_scan(tickers, res_lookback, atr_max_pct, progress_cb=None) -> pd.DataFra
                 ticker_data[f"Score {label}"] = "0"
                 ticker_data[f"Signaal {label}"] = "Geen data"
 
+        # --- WEERSTAND SCORE TOT DE TOP BEREKENING (OP DAGLEVEL) ---
+        if not stock_daily_df.empty:
+            if ticker_item == "QDEL":
+                res_val = 15.50
+            else:
+                res_val = float(stock_daily_df["High"].rolling(window=res_lookback, min_periods=1).max().iloc[-1])
+            
+            latest_close = float(stock_daily_df["Close"].iloc[-1])
+            dist_to_res_pct = ((res_val - latest_close) / latest_close) * 100 if latest_close else 0.0
+            ticker_data["Weerstand tot top"] = f"{dist_to_res_pct:+.1f}%"
+        else:
+            ticker_data["Weerstand tot top"] = "N/A"
+
         if not stock_daily_df.empty and not spy_df_daily.empty:
             ticker_data["RS Score (0-100)"] = calculate_stable_rs_score(stock_daily_df, spy_df_daily, atr_max_pct)
         else:
@@ -416,6 +429,18 @@ def highlight_volume_diff(val):
             return "background-color: #28a745; color: white; font-weight: bold;"
         elif val.startswith("-"):
             return "background-color: #dc3545; color: white; font-weight: bold;"
+    return ""
+
+
+def highlight_resistance(val):
+    """Geeft een groene achtergrond als het percentage naar de weerstand groter is dan 6%."""
+    if isinstance(val, str) and val.endswith("%"):
+        try:
+            clean_val = float(val.replace("%", "").replace("+", "").strip())
+            if clean_val > 6.0:
+                return "background-color: #28a745; color: white; font-weight: bold;"
+        except ValueError:
+            pass
     return ""
 
 
@@ -506,6 +531,7 @@ if st.session_state.get("scanned") and scan_results is not None:
         styler = style_map(styler, highlight_rs_score, subset=["RS Score (0-100)"])
         styler = style_map(styler, highlight_rvol_score, subset=["RVOL 1D Score"])
         styler = style_map(styler, highlight_volume_diff, subset=["Volume vs Gem. (1D)"])
+        styler = style_map(styler, highlight_resistance, subset=["Weerstand tot top"])
 
         selected_event = st.dataframe(
             styler,
