@@ -198,14 +198,14 @@ def calculate_daily_rvol_and_diff(df_stock: pd.DataFrame):
 def get_signal_badge(score: int) -> str:
     """Vertaalt de score naar een compact signaal."""
     mapping = {
-        5: "🚀 Strong Buy (5)",
-        4: "📈 Buy (4)",
-        3: "⚖️ Hold (3)",
-        2: "📉 Sell (2)",
-        1: "🔴 Strong Sell (1)",
-        0: "🔴 Strong Sell (0)",
+        5: "🚀 Strong Buy",
+        4: "📈 Buy",
+        3: "⚖️ Hold",
+        2: "📉 Sell",
+        1: "🔴 Strong Sell",
+        0: "🔴 Strong Sell",
     }
-    return mapping.get(score, "N/A")
+    return mapping.get(score, "⚖️ Hold")
 
 # ─────────────────────────────────────────────────────────────
 # SECTION 1: SCANNER TABEL BEREKENEN & INTERACTIE
@@ -274,9 +274,10 @@ if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or "scanne
             ticker_data["RVOL 1D Score"] = 0
             ticker_data["Volume vs Gem. (1D)"] = "N/A"
 
-        # Algemeen Advies Signaal op basis van de 1D score toevoegen aan het overzicht
-        latest_1d_score = int(str(ticker_data.get("Score 1D", "0")).replace("⚠️", "").strip()) if str(ticker_data.get("Score 1D", "0")).replace("⚠️", "").strip().isdigit() else 0
-        ticker_data["Advies Signaal"] = get_signal_badge(latest_1d_score)
+        # Dynamisch advies signaal bepalen op basis van de 1D score
+        score_1d_raw = ticker_data.get("Score 1D", "0")
+        clean_score_1d = int(str(score_1d_raw).replace("⚠️", "").strip()) if str(score_1d_raw).replace("⚠️", "").strip().isdigit() else 0
+        ticker_data["Advies Signaal"] = get_signal_badge(clean_score_1d)
 
         ticker_data["Totale Matrix Score"] = total_score_sum
         results.append(ticker_data)
@@ -331,11 +332,12 @@ if "scan_results" in st.session_state:
         return ""
 
     def highlight_advies_signaal(val):
-        if "Strong Buy" in str(val) or "Buy" in str(val):
+        val_str = str(val)
+        if "Strong Buy" in val_str or "Buy" in val_str:
             return "background-color: #28a745; color: white; font-weight: bold;"
-        elif "Hold" in str(val):
+        elif "Hold" in val_str:
             return "background-color: #ffc107; color: black; font-weight: bold;"
-        elif "Sell" in str(val):
+        elif "Sell" in val_str:
             return "background-color: #dc3545; color: white; font-weight: bold;"
         return ""
 
@@ -388,8 +390,13 @@ else:
 if df_single.empty:
     st.error(f"Geen data gevonden voor ticker '{active_ticker}'. Controleer het symbool.")
 else:
+    latest_row = df_single.iloc[-1]
+    latest_score = int(latest_row["Score"]) if "Score" in df_single else 3
+    calculated_action_signal = get_signal_badge(latest_score)
+
     if has_ta_engine:
         signals = analyzer.evaluate_signals(df_single)
+        signals["Action"] = calculated_action_signal
         ml_res = analyzer.predict_ml_probability(
             df_single, 
             forecast_horizon=forecast_horizon, 
@@ -411,8 +418,8 @@ else:
             "RSI_Cross_55": rsi_val > 55 and df_single["RSI"].iloc[-2] <= 55,
             "STO_Status": "N/A",
             "MACD_Status": "N/A",
-            "Action": "NEUTRAAL",
-            "Reasons": ["Geen ta_engine.py geladen, basis yfinance analyse gebruikt."]
+            "Action": calculated_action_signal,
+            "Reasons": [f"Advies op basis van live indicator score ({latest_score}/5)."]
         }
         ml_res = {"up_prob": 50, "best_params": {}, "feature_importances": {"RSI": 1.0}}
 
