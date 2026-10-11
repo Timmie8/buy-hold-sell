@@ -37,29 +37,22 @@ if "selected_ticker" not in st.session_state:
 st.sidebar.header("⚙️ Instellingen Scanner & Dashboard")
 
 # Ticker selectie voor de Scanner
-default_tickers = "AAPL, MSFT, NVDA, TSLA, AMZN, GOOGL, META, AMD, INTC, PLTR, MTZ"
+default_tickers = "AAPL, MSFT, NVDA, TSLA, AMZN, GOOGL, META, AMD, INTC, PLTR"
 ticker_input = st.sidebar.text_area(
     "Scanner Tickers (gescheiden door komma)", default_tickers, height=100
 )
 
-# Lijst van actieve tickers parsen
-tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
-
 st.sidebar.markdown("---")
 st.sidebar.header("📊 Grafiek / AI Single Stock View")
 
-# Zorg dat de selectbox alle huidige gescande/ingevoerde tickers bevat
-if st.session_state["selected_ticker"] not in tickers and tickers:
-    st.session_state["selected_ticker"] = tickers[0]
-
-selected_ticker = st.sidebar.selectbox(
+# Ticker input synchroon houden met st.session_state
+manual_ticker = st.sidebar.text_input(
     "Gedetailleerde Analyse Ticker", 
-    options=tickers, 
-    index=tickers.index(st.session_state["selected_ticker"]) if st.session_state["selected_ticker"] in tickers else 0
-)
+    value=st.session_state["selected_ticker"]
+).upper()
 
-if selected_ticker != st.session_state["selected_ticker"]:
-    st.session_state["selected_ticker"] = selected_ticker
+if manual_ticker != st.session_state["selected_ticker"]:
+    st.session_state["selected_ticker"] = manual_ticker
 
 timeframe = st.sidebar.selectbox("Timeframe Grafiek", options=["1d", "15m", "5m"], index=0)
 period = st.sidebar.selectbox("Historie Periode", options=["1y", "6mo", "1mo"], index=0)
@@ -123,26 +116,6 @@ def calculate_trading_score(df: pd.DataFrame) -> pd.DataFrame:
     df["RSI_Cross_55"] = (df["RSI"] > 55) & (df["RSI"].shift(1) <= 55)
 
     return df
-
-def calculate_pe_valuation(ticker: str) -> dict:
-    """Haalt fundamentele PE-waardering op via yfinance."""
-    try:
-        t_obj = yf.Ticker(ticker)
-        info = t_obj.info
-        current_pe = info.get("trailingPE", None)
-        forward_pe = info.get("forwardPE", None)
-        
-        pe_status = "Onbekend"
-        if current_pe and current_pe > 0:
-            pe_status = "Ondergewaardeerd" if current_pe < 25 else "Overgewaardeerd"
-        
-        return {
-            "current_pe": round(current_pe, 2) if current_pe else "N/A",
-            "forward_pe": round(forward_pe, 2) if forward_pe else "N/A",
-            "status": pe_status
-        }
-    except Exception:
-        return {"current_pe": "N/A", "forward_pe": "N/A", "status": "Fout"}
 
 def calculate_stable_rs_score(df_stock: pd.DataFrame, df_spy: pd.DataFrame, atr_max_pct: float = 3.0) -> int:
     """Berekent de Stable Relative Strength Score (0 - 100)."""
@@ -230,6 +203,8 @@ def get_signal_badge(score: int) -> str:
 # ─────────────────────────────────────────────────────────────
 # SECTION 1: SCANNER TABEL BEREKENEN & INTERACTIE
 # ─────────────────────────────────────────────────────────────
+tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
+
 if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or "scanned" not in st.session_state:
     st.session_state["scanned"] = True
     results = []
@@ -267,7 +242,11 @@ if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or "scanne
                     latest = df_calc.iloc[-1]
 
                     score_val = int(latest["Score"])
+                    
+                    # Controleer op RSI Breakout
                     rsi_breakout = latest.get("RSI_Cross_55", False) or (latest.get("RSI", 0) > 55 and df_calc["RSI"].iloc[-2] <= 55)
+                    
+                    # Gele driehoek toevoegen bij breakout
                     score_display = f"⚠️ {score_val}" if rsi_breakout else f"{score_val}"
 
                     ticker_data["Prijs ($)"] = round(float(latest["Close"]), 2)
@@ -294,10 +273,6 @@ if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or "scanne
             ticker_data["RVOL 1D Score"] = 0
             ticker_data["Volume vs Gem. (1D)"] = "N/A"
 
-        pe_info = calculate_pe_valuation(ticker_item)
-        ticker_data["PE Valuation"] = pe_info["status"]
-        ticker_data["Current PE"] = pe_info["current_pe"]
-
         ticker_data["Totale Matrix Score"] = total_score_sum
         results.append(ticker_data)
 
@@ -308,94 +283,93 @@ if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or "scanne
 
     if results:
         res_df = pd.DataFrame(results).sort_values(by="Totale Matrix Score", ascending=False)
-        st.session_state["scan_results"] = res_df
+        display_df = res_df.drop(columns=["Totale Matrix Score"])
 
-# Als er scanresultaten in session state staan, tonen we de tabel
-if "scan_results" in st.session_state:
-    res_df = st.session_state["scan_results"]
-    display_df = res_df.drop(columns=["Totale Matrix Score"])
+        def highlight_scores(val):
+            val_str = str(val)
+            clean_val = int(val_str.replace("⚠️", "").strip()) if val_str.replace("⚠️", "").strip().isdigit() else 0
+            
+            style = ""
+            if clean_val >= 4:
+                style = "background-color: #28a745; color: white; font-weight: bold;"
+            elif clean_val == 3:
+                style = "background-color: #ffc107; color: black; font-weight: bold;"
+            else:
+                style = "background-color: #dc3545; color: white; font-weight: bold;"
+                
+            if "⚠️" in val_str:
+                style += " border: 2px solid #ffcc00;"
+            return style
 
-    def highlight_scores(val):
-        val_str = str(val)
-        clean_val = int(val_str.replace("⚠️", "").strip()) if val_str.replace("⚠️", "").strip().isdigit() else 0
-        style = ""
-        if clean_val >= 4:
-            style = "background-color: #28a745; color: white; font-weight: bold;"
-        elif clean_val == 3:
-            style = "background-color: #ffc107; color: black; font-weight: bold;"
-        else:
-            style = "background-color: #dc3545; color: white; font-weight: bold;"
-        if "⚠️" in val_str:
-            style += " border: 2px solid #ffcc00;"
-        return style
+        def highlight_rs_score(val):
+            if isinstance(val, int):
+                if val >= 70:
+                    return "background-color: #28a745; color: white; font-weight: bold;"
+                elif val >= 50:
+                    return "background-color: #fd7e14; color: white; font-weight: bold;"
+                else:
+                    return "background-color: #dc3545; color: white; font-weight: bold;"
+            return ""
 
-    def highlight_rs_score(val):
-        if isinstance(val, int):
-            if val >= 70: return "background-color: #28a745; color: white; font-weight: bold;"
-            elif val >= 50: return "background-color: #fd7e14; color: white; font-weight: bold;"
-            else: return "background-color: #dc3545; color: white; font-weight: bold;"
-        return ""
+        def highlight_rvol_score(val):
+            if isinstance(val, int):
+                if val >= 75:
+                    return "background-color: #28a745; color: white; font-weight: bold;"
+                elif val >= 50:
+                    return "background-color: #ffc107; color: black; font-weight: bold;"
+                elif val >= 25:
+                    return "background-color: #fd7e14; color: white; font-weight: bold;"
+                else:
+                    return "background-color: #dc3545; color: white; font-weight: bold;"
+            return ""
 
-    def highlight_rvol_score(val):
-        if isinstance(val, int):
-            if val >= 75: return "background-color: #28a745; color: white; font-weight: bold;"
-            elif val >= 50: return "background-color: #ffc107; color: black; font-weight: bold;"
-            elif val >= 25: return "background-color: #fd7e14; color: white; font-weight: bold;"
-            else: return "background-color: #dc3545; color: white; font-weight: bold;"
-        return ""
+        def highlight_volume_diff(val):
+            if isinstance(val, str) and val.endswith("%"):
+                if val.startswith("+"):
+                    return "background-color: #28a745; color: white; font-weight: bold;"
+                elif val.startswith("-"):
+                    return "background-color: #dc3545; color: white; font-weight: bold;"
+            return ""
 
-    def highlight_volume_diff(val):
-        if isinstance(val, str) and val.endswith("%"):
-            if val.startswith("+"): return "background-color: #28a745; color: white; font-weight: bold;"
-            elif val.startswith("-"): return "background-color: #dc3545; color: white; font-weight: bold;"
-        return ""
+        st.subheader("📋 Multi-Timeframe Score Overzicht")
+        st.caption("💡 **Tip:** Klik op een regel in de tabel om de grafiek en AI-analyse eronder direct te laden.")
+        
+        styled_df = (
+            display_df.style
+            .map(highlight_scores, subset=["Score 1D", "Score 1H", "Score 15M"])
+            .map(highlight_rs_score, subset=["RS Score (0-100)"])
+            .map(highlight_rvol_score, subset=["RVOL 1D Score"])
+            .map(highlight_volume_diff, subset=["Volume vs Gem. (1D)"])
+        )
 
-    def highlight_pe_valuation(val):
-        if val == "Ondergewaardeerd": return "background-color: #28a745; color: white; font-weight: bold;"
-        elif val == "Overgewaardeerd": return "background-color: #dc3545; color: white; font-weight: bold;"
-        return ""
+        selected_event = st.dataframe(
+            styled_df,
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row"
+        )
 
-    st.subheader("📋 Multi-Timeframe Score Overzicht")
-    st.caption("💡 **Tip:** Klik op een willekeurige rij in de tabel om de analyse en grafiek hieronder direct te laden voor dat aandeel.")
-
-    styled_df = (
-        display_df.style
-        .map(highlight_scores, subset=["Score 1D", "Score 1H", "Score 15M"])
-        .map(highlight_rs_score, subset=["RS Score (0-100)"])
-        .map(highlight_rvol_score, subset=["RVOL 1D Score"])
-        .map(highlight_volume_diff, subset=["Volume vs Gem. (1D)"])
-        .map(highlight_pe_valuation, subset=["PE Valuation"])
-    )
-
-    # Betrouwbare event-afhandeling voor tabelselectie in Streamlit
-    selected_event = st.dataframe(
-        styled_df,
-        use_container_width=True,
-        hide_index=True,
-        on_select="rerun",
-        selection_mode="single-row"
-    )
-
-    if selected_event and "selection" in selected_event and selected_event.selection.get("rows"):
-        selected_row_idx = selected_event.selection["rows"][0]
-        clicked_ticker = display_df.iloc[selected_row_idx]["Ticker"]
-        if clicked_ticker != st.session_state["selected_ticker"]:
-            st.session_state["selected_ticker"] = clicked_ticker
-            st.rerun()
+        if selected_event and selected_event.selection.rows:
+            selected_row_idx = selected_event.selection.rows[0]
+            clicked_ticker = display_df.iloc[selected_row_idx]["Ticker"]
+            if clicked_ticker != st.session_state["selected_ticker"]:
+                st.session_state["selected_ticker"] = clicked_ticker
+                st.rerun()
 
 # ─────────────────────────────────────────────────────────────
 # SECTION 2: AI LIVE TRADING DASHBOARD (GESELECTEERDE TICKER)
 # ─────────────────────────────────────────────────────────────
-active_ticker = st.session_state["selected_ticker"]
+selected_ticker = st.session_state["selected_ticker"]
 
 st.markdown("---")
-st.header(f"📊 AI Live Trading Dashboard: {active_ticker}")
+st.header(f"📊 AI Live Trading Dashboard: {selected_ticker}")
 
 if has_ta_engine:
-    df_single = analyzer.get_stock_data(symbol=active_ticker, timeframe=timeframe, period=period)
+    df_single = analyzer.get_stock_data(symbol=selected_ticker, timeframe=timeframe, period=period)
     df_single = calculate_trading_score(df_single)
 else:
-    df_single = yf.download(active_ticker, period=period, interval=timeframe, progress=False)
+    df_single = yf.download(selected_ticker, period=period, interval=timeframe, progress=False)
     if not df_single.empty:
         if isinstance(df_single.columns, pd.MultiIndex):
             df_single.columns = df_single.columns.get_level_values(0)
@@ -403,7 +377,7 @@ else:
         df_single = calculate_trading_score(df_single)
 
 if df_single.empty:
-    st.error(f"Geen data gevonden voor ticker '{active_ticker}'. Controleer het symbool.")
+    st.error(f"Geen data gevonden voor ticker '{selected_ticker}'. Controleer het symbool.")
 else:
     if has_ta_engine:
         signals = analyzer.evaluate_signals(df_single)
@@ -433,42 +407,78 @@ else:
         }
         ml_res = {"up_prob": 50, "best_params": {}, "feature_importances": {"RSI": 1.0}}
 
+    # Berekening 10D weerstand en ruimte
     latest_close = float(df_single["Close"].iloc[-1])
     res_10d_val = float(df_single["Res_10D"].iloc[-1]) if "Res_10D" in df_single else latest_close
     res_10d_10pct_val = float(df_single["Res_10D_10Pct"].iloc[-1]) if "Res_10D_10Pct" in df_single else latest_close * 1.10
     dist_to_res_pct = ((res_10d_val - latest_close) / latest_close) * 100
-    
-    pe_data = calculate_pe_valuation(active_ticker)
 
+    # 1. Status & kleur voor de RSI badge
     if signals.get('RSI_Overbought_Warning', False):
         rsi_status_text = f"OVERBOUGHT ({signals['RSI']})"
-        bg_color, text_color = "#FF4B4B", "#FFFFFF"
+        bg_color = "#FF4B4B"
+        text_color = "#FFFFFF"
     elif signals.get('RSI_Stijgend_Boven_70', False):
         rsi_status_text = f"🚀 STRONG > 70 ({signals['RSI']})"
-        bg_color, text_color = "#28A745", "#FFFFFF"
+        bg_color = "#28A745"
+        text_color = "#FFFFFF"
     elif signals.get('RSI_Above_55', False):
-        rsi_status_text = f"🔥 BREAKOUT > 55 ({signals['RSI']})" if signals.get('RSI_Cross_55', False) else f"BULLISH > 55 ({signals['RSI']})"
-        bg_color, text_color = "#28A745", "#FFFFFF"
+        if signals.get('RSI_Cross_55', False):
+            rsi_status_text = f"🔥 BREAKOUT > 55 ({signals['RSI']})"
+        else:
+            rsi_status_text = f"BULLISH > 55 ({signals['RSI']})"
+        bg_color = "#28A745"
+        text_color = "#FFFFFF"
     else:
         rsi_status_text = f"BEARISH < 55 ({signals['RSI']})"
-        bg_color, text_color = "#6C757D", "#FFFFFF"
+        bg_color = "#6C757D"
+        text_color = "#FFFFFF"
 
+    # 2. Live Dashboard Balk
     st.markdown("### 📊 Live Dashboard & Signalen")
-    m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
+    m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
 
-    with m1: st.metric("Laatste Prijs", f"${signals['Price']:.2f}", f"{signals['Change_Pct']}%")
+    with m1:
+        st.metric("Laatste Prijs", f"${signals['Price']:.2f}", f"{signals['Change_Pct']}%")
+
     with m2:
         st.caption("RSI (14) Status")
-        st.markdown(f'<div style="background-color: {bg_color}; color: {text_color}; padding: 8px 10px; border-radius: 8px; text-align: center; font-weight: bold; font-size: 13px;">{rsi_status_text}</div>', unsafe_allow_html=True)
-    with m3: st.metric("Slow-STO", signals['STO_Status'])
-    with m4: st.metric("MACD", signals['MACD_Status'])
-    with m5: st.metric("Advies Signaal", signals['Action'])
-    with m6: st.metric("10D Resistance", f"${res_10d_val:.2f}", f"{dist_to_res_pct:+.1f}% tot top")
-    with m7: st.metric("PE Valuation", pe_data["status"], f"PE: {pe_data['current_pe']}")
-    with m8: st.metric("🤖 ML Kans (+{f}d)".format(f=forecast_horizon), f"{ml_res['up_prob']}%")
+        st.markdown(
+            f"""
+            <div style="
+                background-color: {bg_color};
+                color: {text_color};
+                padding: 8px 10px;
+                border-radius: 8px;
+                text-align: center;
+                font-weight: bold;
+                font-size: 13px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            ">
+                {rsi_status_text}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    with m3:
+        st.metric("Slow-STO", signals['STO_Status'])
+
+    with m4:
+        st.metric("MACD", signals['MACD_Status'])
+
+    with m5:
+        st.metric("Advies Signaal", signals['Action'])
+
+    with m6:
+        st.metric("10D Resistance", f"${res_10d_val:.2f}", f"{dist_to_res_pct:+.1f}% tot top")
+
+    with m7:
+        st.metric("🤖 ML Kans (+{f}d)".format(f=forecast_horizon), f"{ml_res['up_prob']}%")
 
     st.markdown("---")
 
+    # 3. Technische Grafiek & Indicatoren
     fig = make_subplots(
         rows=3, cols=1, 
         shared_xaxes=True, 
@@ -479,11 +489,34 @@ else:
 
     x_axis = df_single['Timestamp'] if 'Timestamp' in df_single else df_single.index
 
-    fig.add_trace(go.Candlestick(x=x_axis, open=df_single['Open'], high=df_single['High'], low=df_single['Low'], close=df_single['Close'], name='Koers'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=x_axis, y=df_single['Res_10D'], mode='lines', name='10D Resistance', line=dict(color='red', width=1.5, dash='dash')), row=1, col=1)
-    fig.add_trace(go.Scatter(x=x_axis, y=df_single['Res_10D_10Pct'], mode='lines', name='10D Res +10% Zone', line=dict(color='orange', width=1.5, dash='dot')), row=1, col=1)
-    fig.add_trace(go.Bar(x=x_axis, y=df_single['Volume'], name='Volume', marker_color='lightblue'), row=2, col=1)
-    fig.add_trace(go.Scatter(x=x_axis, y=df_single['RSI'], mode='lines', name='RSI', line=dict(color='purple')), row=3, col=1)
+    # Candlesticks
+    fig.add_trace(go.Candlestick(
+        x=x_axis, open=df_single['Open'], high=df_single['High'], 
+        low=df_single['Low'], close=df_single['Close'], name='Koers'
+    ), row=1, col=1)
+
+    # 10D Resistance Lijn & 10% Zone Lijn toevoegen op de grafiek
+    fig.add_trace(go.Scatter(
+        x=x_axis, y=df_single['Res_10D'], mode='lines',
+        name='10D Resistance', line=dict(color='red', width=1.5, dash='dash')
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=x_axis, y=df_single['Res_10D_10Pct'], mode='lines',
+        name='10D Res +10% Zone', line=dict(color='orange', width=1.5, dash='dot')
+    ), row=1, col=1)
+
+    # Volume
+    fig.add_trace(go.Bar(
+        x=x_axis, y=df_single['Volume'], name='Volume', 
+        marker_color='lightblue'
+    ), row=2, col=1)
+
+    # RSI + Hulplijnen (30, 55, 70)
+    fig.add_trace(go.Scatter(
+        x=x_axis, y=df_single['RSI'], mode='lines', 
+        name='RSI', line=dict(color='purple')
+    ), row=3, col=1)
 
     fig.add_hline(y=70, line_dash="dot", line_color="red", row=3, col=1)
     fig.add_hline(y=55, line_dash="dash", line_color="green", annotation_text="Breakout (55)", row=3, col=1)
@@ -492,23 +525,29 @@ else:
     fig.update_layout(height=750, showlegend=True, xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
 
+    # 4. ML Details & Onderbouwing
     col_reasons, col_ml = st.columns(2)
 
     with col_reasons:
         with st.expander("📋 Signaal Onderbouwing", expanded=True):
-            for r in signals['Reasons']: st.write(r)
-            st.write(f"- **10D Resistance:** `${res_10d_val:.2f}`")
-            st.write(f"- **10D Resistance (+10% zone):** `${res_10d_10pct_val:.2f}`")
-            st.write(f"- **PE Valuation Check:** `{pe_data['status']}` (Current PE: `{pe_data['current_pe']}`, Forward PE: `{pe_data['forward_pe']}`)")
+            for r in signals['Reasons']:
+                st.write(r)
+            st.write(f"- **10D Resistance:** ${res_10d_val:.2f}")
+            st.write(f"- **10D Resistance (+10% zone):** ${res_10d_10pct_val:.2f}")
 
     with col_ml:
         with st.expander("🤖 Machine Learning Model Details", expanded=True):
             st.write(f"**Voorspelde kans op prijsstijging:** `{ml_res['up_prob']}%`")
             st.progress(ml_res['up_prob'] / 100)
+
             if enable_grid_search and "best_params" in ml_res and ml_res["best_params"]:
                 st.markdown("**Gevonden Optimale Parameters (GridSearch):**")
                 st.json(ml_res["best_params"])
+
             if 'feature_importances' in ml_res:
                 st.markdown("**Top Gewichten Indicatoren:**")
-                feat_df = pd.DataFrame(list(ml_res['feature_importances'].items()), columns=['Indicator', 'Gewicht']).sort_values(by='Gewicht', ascending=False)
+                feat_df = pd.DataFrame(
+                    list(ml_res['feature_importances'].items()), 
+                    columns=['Indicator', 'Gewicht']
+                ).sort_values(by='Gewicht', ascending=False)
                 st.dataframe(feat_df.head(4), use_container_width=True, hide_index=True)
