@@ -195,36 +195,22 @@ def calculate_daily_rvol_and_diff(df_stock: pd.DataFrame):
     except Exception:
         return 0, "N/A"
 
-def calculate_resistance_score(df_stock: pd.DataFrame) -> tuple:
-    """Berekent de Resistance Score (0-100) op basis van de afstand tot de 10D Resistance."""
+def calculate_resistance_distance(df_stock: pd.DataFrame) -> str:
+    """Berekent de afstand tot de 10D Resistance in percentage."""
     try:
         if len(df_stock) < 10:
-            return 0, "N/A"
+            return "N/A"
         
         latest_close = float(df_stock["Close"].iloc[-1])
         res_10d = float(df_stock["High"].rolling(window=10).max().iloc[-1])
         
         if res_10d <= 0:
-            return 0, "N/A"
+            return "N/A"
             
         dist_pct = ((res_10d - latest_close) / latest_close) * 100
-        
-        # Scoring logica: 
-        # Als de afstand heel klein is (< 1%): dicht bij resistance (risico op afwijzing = lagere score of specifieke beoordeling)
-        # Als er mooie ruimte is (tussen 2% en 8%): ideale breakout/momentum ruimte (hoge score)
-        # Als de afstand te groot is (> 15%): minder directe actie.
-        if dist_pct <= 1.0:
-            res_score = 40  # Dicht bij resistance / breakout zone
-        elif 1.0 < dist_pct <= 5.0:
-            res_score = 90  # Perfecte ruimte tot de top
-        elif 5.0 < dist_pct <= 10.0:
-            res_score = 70  # Goede ruimte
-        else:
-            res_score = 50  # Ver verwijderd van recente top
-            
-        return res_score, f"{dist_pct:+.1f}%"
+        return f"{dist_pct:.1f}%"
     except Exception:
-        return 0, "N/A"
+        return "N/A"
 
 def get_signal_badge(score: int) -> str:
     """Vertaalt de score naar een compact signaal."""
@@ -302,14 +288,11 @@ if st.sidebar.button("🚀 Run Multi-Timeframe Scan", type="primary") or "scanne
             ticker_data["RVOL 1D Score"] = rvol_daily_score
             ticker_data["Volume vs Gem. (1D)"] = volume_diff
 
-            # Resistance Score en Afstand toevoegen
-            res_score, res_dist = calculate_resistance_score(stock_daily_df)
-            ticker_data["Resistance Score"] = res_score
-            ticker_data["Afstand t.o.v. 10D Top"] = res_dist
+            # Afstand tot 10D Top toevoegen
+            ticker_data["Afstand t.o.v. 10D Top"] = calculate_resistance_distance(stock_daily_df)
         else:
             ticker_data["RVOL 1D Score"] = 0
             ticker_data["Volume vs Gem. (1D)"] = "N/A"
-            ticker_data["Resistance Score"] = 0
             ticker_data["Afstand t.o.v. 10D Top"] = "N/A"
 
         score_1d_raw = ticker_data.get("Score 1D", "0")
@@ -362,11 +345,16 @@ if "scan_results" in st.session_state:
             else: return "background-color: #dc3545; color: white; font-weight: bold;"
         return ""
 
-    def highlight_resistance_score(val):
-        if isinstance(val, int):
-            if val >= 80: return "background-color: #28a745; color: white; font-weight: bold;"
-            elif val >= 50: return "background-color: #ffc107; color: black; font-weight: bold;"
-            else: return "background-color: #fd7e14; color: white; font-weight: bold;"
+    def highlight_distance(val):
+        if isinstance(val, str) and val.endswith("%"):
+            try:
+                num_val = float(val.replace("%", "").strip())
+                if num_val > 5.0:
+                    return "background-color: #28a745; color: white; font-weight: bold;"
+                else:
+                    return "background-color: #6c757d; color: white; font-weight: bold;"
+            except ValueError:
+                pass
         return ""
 
     def highlight_volume_diff(val):
@@ -393,7 +381,7 @@ if "scan_results" in st.session_state:
         .map(highlight_scores, subset=["Score 1D", "Score 1H", "Score 15M"])
         .map(highlight_rs_score, subset=["RS Score (0-100)"])
         .map(highlight_rvol_score, subset=["RVOL 1D Score"])
-        .map(highlight_resistance_score, subset=["Resistance Score"])
+        .map(highlight_distance, subset=["Afstand t.o.v. 10D Top"])
         .map(highlight_volume_diff, subset=["Volume vs Gem. (1D)"])
         .map(highlight_advies_signaal, subset=["Advies Signaal"])
     )
@@ -538,8 +526,3 @@ else:
             st.progress(ml_res['up_prob'] / 100)
             if enable_grid_search and "best_params" in ml_res and ml_res["best_params"]:
                 st.markdown("**Gevonden Optimale Parameters (GridSearch):**")
-                st.json(ml_res["best_params"])
-            if 'feature_importances' in ml_res:
-                st.markdown("**Top Gewichten Indicatoren:**")
-                feat_df = pd.DataFrame(list(ml_res['feature_importances'].items()), columns=['Indicator', 'Gewicht']).sort_values(by='Gewicht', ascending=False)
-                st.dataframe(feat_df.head(4), use_container_width=True, hide_index=True)
